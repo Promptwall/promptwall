@@ -64,6 +64,11 @@ struct Args {
     #[arg(long, global = true, env = "PROMPTWALL_MODEL_SESSIONS")]
     model_sessions: Option<usize>,
 
+    /// Address for Prometheus metrics (`GET /metrics`), such as
+    /// 127.0.0.1:9464. Off unless set; keep it off the public network.
+    #[arg(long, env = "PROMPTWALL_METRICS_LISTEN")]
+    metrics_listen: Option<SocketAddr>,
+
     /// Threads each classifier session may use for one inference (default 1).
     /// More threads make each check faster; more sessions let more checks run
     /// at the same time.
@@ -221,6 +226,11 @@ async fn main() -> anyhow::Result<()> {
             println!("text: {}", verdict.text);
             return Ok(());
         }
+    }
+    if let Some(addr) = args.metrics_listen {
+        let (listener, addr) = promptwall::bind(addr).await?;
+        tracing::info!(%addr, "metrics on /metrics");
+        tokio::spawn(promptwall::metrics::serve(listener));
     }
     let (listener, addr) = promptwall::bind(args.listen).await?;
     tracing::info!(%addr, "promptwall listening");

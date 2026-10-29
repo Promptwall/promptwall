@@ -44,6 +44,14 @@ cargo run --release -p promptwall -- test --policy examples/policy.yaml    # the
 cargo run --release -p promptwall -- scan --policy examples/policy.yaml --route openai "mail jane@corp.io"
 ```
 
+To see what it does on a dashboard, start Promptwall with Prometheus and Grafana (needs Docker; sends sample traffic to a mock provider):
+
+```sh
+cd deploy/compose && docker compose --profile demo up --build    # then open http://localhost:3000
+```
+
+See [monitoring](docs/monitoring.md) for the metrics.
+
 To measure the latency the proxy adds:
 
 ```sh
@@ -71,6 +79,7 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | [Policy format](docs/specs/policy-format.md) | Draft of the YAML policy language |
 | [Benchmark](docs/specs/benchmark.md) | How latency and detection accuracy are measured |
 | [Models](docs/models.md) | Tier 2 classifiers: model format, latency and accuracy of open models |
+| [Monitoring](docs/monitoring.md) | Prometheus metrics and the Grafana dashboard |
 
 ## Contributing
 
