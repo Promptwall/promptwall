@@ -10,11 +10,41 @@
 | `upstreams.<name>.url` | Yes (scheme and host only, no path) |
 | `routes[].name`, `match.path` (prefix), `match.header` (exact value), `upstream`, `fail_mode`, `shadow` | Yes |
 | `routes[].input` with `detector: pii` or `secrets`, `entities`, `action: block \| redact \| flag` | Yes |
+| `routes[].input` with `detector: custom`, `name`, `pattern` or `keywords`, `action` | Yes |
 | `threshold`, `prompt_injection`, `untrusted_content`, `output`, `rules`, `limits`, `tests` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
 
-Entity names: `pii`: `email`, `phone` (international `+` format only), `iban` (checksum verified), `credit_card` (network prefix and Luhn verified). `secrets`: `openai_key`, `anthropic_key`, `aws_access_key`, `github_token`, `slack_token`, `stripe_key`, `google_api_key`, `private_key`, `jwt`. An empty `entities` list means all entities of that detector. When several entries cover the same entity, the first one wins.
+Entity names. An empty `entities` list means all entities of that detector. When several entries cover the same entity, the first one wins.
+
+| Detector | Entity | How it is matched |
+| --- | --- | --- |
+| `pii` | `email`, `ip_address` | Format (IPv4, full IPv6) |
+| `pii` | `phone` | International `+` format only |
+| `pii` | `iban`, `credit_card` | Checksum (mod 97, Luhn plus network prefix) |
+| `pii` | `bic`, `vat_id` | Format, only next to a keyword such as "BIC", "SWIFT", "VAT", "USt" |
+| `pii` | `de_tax_id`, `nl_bsn`, `pl_pesel` | Checksum, only next to a keyword (e.g. "Steuer-ID", "BSN", "PESEL") |
+| `pii` | `es_dni`, `it_fiscal_code`, `fr_nir`, `uk_nino` | Format and check letter or checksum |
+| `pii` | `us_ssn` | `123-45-6789` form, or nine digits next to "SSN" |
+| `secrets` | `openai_key`, `anthropic_key`, `aws_access_key`, `github_token`, `slack_token`, `stripe_key`, `google_api_key`, `azure_storage_key`, `gcp_service_account`, `huggingface_token`, `npm_token`, `twilio_key`, `sendgrid_key`, `private_key`, `jwt` | Provider token format |
+| `secrets` | `url_credentials` | The password in `scheme://user:password@host` |
+| `secrets` | `password` | The value in `password=...`, `"passwd": "..."` and similar; placeholders are ignored |
+
+Context keywords must appear within 48 bytes before the value. They keep generic numbers such as order IDs from being reported as tax IDs.
+
+Custom detectors add company-specific data. Each needs a `name` (lowercase letters, digits and `_`) and exactly one of `pattern` (a regular expression) or `keywords` (case-insensitive words or phrases, matched on word boundaries). Findings are reported as `custom.<name>` and redacted as `[REDACTED:<NAME>]`.
+
+```yaml
+input:
+  - detector: custom
+    name: employee_id
+    pattern: 'EMP-[0-9]{6}'
+    action: redact
+  - detector: custom
+    name: project_names
+    keywords: [Project Falcon, Bluebird]
+    action: block
+```
 
 `fail_mode` applies to request bodies that cannot be inspected: compressed bodies, bodies over 4 MiB, and binary bodies. Bodies over 32 MiB are always rejected with `413`.
 

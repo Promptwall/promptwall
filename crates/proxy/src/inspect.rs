@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bytes::Bytes;
-use promptwall_detect::{redact, Detector, Kind};
+use promptwall_detect::{Detector, Kind};
 use serde_json::Value;
 
 use crate::policy::Action;
@@ -14,7 +14,8 @@ pub struct Outcome {
     /// Most severe action triggered, if anything was found.
     pub action: Option<Action>,
     /// How often each kind was found. Values are never kept.
-    pub findings: BTreeMap<Kind, usize>,
+    /// Keyed by label, such as `pii.email` or `custom.<name>`.
+    pub findings: BTreeMap<String, usize>,
     /// The rewritten body, when something was redacted and nothing blocked.
     pub redacted_body: Option<Bytes>,
 }
@@ -71,7 +72,7 @@ fn scan_string(
     }
     for f in &findings {
         let action = actions[&f.kind];
-        *outcome.findings.entry(f.kind).or_default() += 1;
+        *outcome.findings.entry(detector.label(f.kind)).or_default() += 1;
         outcome.action = outcome.action.max(Some(action));
     }
     let to_redact: Vec<_> = findings
@@ -81,7 +82,7 @@ fn scan_string(
     if to_redact.is_empty() {
         return false;
     }
-    *s = redact(s, &to_redact);
+    *s = detector.redact(s, &to_redact);
     true
 }
 
@@ -112,7 +113,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.action, Some(Action::Redact));
-        assert_eq!(out.findings[&Kind::Email], 1);
+        assert_eq!(out.findings["pii.email"], 1);
         let redacted = out.redacted_body.unwrap();
         assert!(
             redacted.starts_with(br#"{"model":"m","messages""#),

@@ -31,8 +31,16 @@ routes:
       - detector: secrets
         action: block
       - detector: pii
-        entities: [email, iban, credit_card]
+        entities: [email, iban, credit_card, vat_id, de_tax_id, it_fiscal_code, es_dni, fr_nir]
         action: redact
       - detector: pii
-        entities: [phone]
         action: flag
+      # Company-specific data: a pattern and a keyword list.
+      - detector: custom
+        name: employee_id
+        pattern: 'EMP-[0-9]{6}'
+        action: redact
+      - detector: custom
+        name: project_names
+        keywords: [Project Falcon]
+        action: block

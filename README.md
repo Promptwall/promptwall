@@ -28,7 +28,7 @@ To inspect requests, start it with a policy instead:
 cargo run --release -p promptwall -- --policy examples/policy.yaml
 ```
 
-With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, and emails, IBANs and card numbers are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
+With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
 
 To measure the latency the proxy adds:
 
