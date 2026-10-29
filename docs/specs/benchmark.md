@@ -22,6 +22,19 @@ It has two parts: **latency** (what the firewall costs) and **accuracy** (what i
 | Detectors | none (pass-through), Tier 1 only, Tier 1 + Tier 2 |
 | Mode | non-streamed, streamed |
 
+### Running it
+
+`scripts/bench.sh` builds release binaries, starts the mock upstream (50 ms delay) and the proxy, then runs `pw-bench`. Pass `--stream`, `--rate`, `--duration`, `--prompt-tokens` or `--max-p95-added-ms` through to `pw-bench`. Added latency is reported as the proxied percentile minus the direct percentile.
+
+First measurement of the pass-through proxy (29 Oct 2026, 4 vCPU cloud VM, mock and proxy on the same host, non-streamed):
+
+| Load | Added p50 | Added p95 |
+| --- | --- | --- |
+| 200 req/s, 2,000-token prompts | 0.54 ms | 0.63 ms |
+| 1,000 req/s, 8,000-token prompts | 0.26 ms | 0.42 ms |
+
+Streamed runs add about 0.2 ms at p50; their tail percentiles are dominated by timer jitter in the mock's 20 ms chunk gaps, so the gate uses non-streamed runs for now.
+
 ### Reference hardware
 
 Results are reported for a 2 vCPU, 4 GB x86 VM and a 2 vCPU ARM VM. CI runs a reduced matrix on a fixed runner type.
@@ -34,6 +47,8 @@ Results are reported for a 2 vCPU, 4 GB x86 VM and a 2 vCPU ARM VM. CI runs a re
 | Tier 1 + Tier 2, 2,000 tokens, concurrency 64 | ≤ 10 ms | ≤ 20 ms | ≤ 40 ms |
 
 CI fails a pull request if p95 regresses by more than 10% against `main`, or exceeds a target.
+
+Current state: CI fails if the pass-through adds more than 5 ms at p95 on a shared GitHub runner. The regression-against-`main` comparison and the tighter targets come with dedicated benchmark runners.
 
 ## Accuracy
 
