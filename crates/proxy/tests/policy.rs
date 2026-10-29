@@ -265,6 +265,7 @@ async fn blocks_prompt_injection() {
     );
 }
 
+#[cfg(feature = "models")]
 async fn start_proxy_with_model(yaml: &str) -> SocketAddr {
     let policy = promptwall::Policy::from_yaml(yaml).unwrap();
     let dir =
@@ -281,6 +282,7 @@ async fn start_proxy_with_model(yaml: &str) -> SocketAddr {
 
 /// The tiny test model (crates/classify/tests/fixtures) flags any text with the
 /// word "attack" in it, which no Tier 1 pattern matches.
+#[cfg(feature = "models")]
 #[tokio::test]
 async fn injection_classifier_blocks_above_its_threshold() {
     let mock = start_mock().await;
@@ -302,6 +304,7 @@ async fn injection_classifier_blocks_above_its_threshold() {
     assert_eq!(action(&resp), None);
 }
 
+#[cfg(feature = "models")]
 #[tokio::test]
 async fn injection_classifier_ignores_the_system_prompt() {
     let mock = start_mock().await;
@@ -343,6 +346,7 @@ fn a_threshold_needs_a_model() {
     assert!(err.to_string().contains("--injection-model"));
 }
 
+#[cfg(feature = "models")]
 #[tokio::test]
 async fn sequential_classifier_blocks_before_forwarding() {
     // Nothing listens upstream: with `parallel: false` the request must not be sent.
@@ -359,6 +363,7 @@ async fn sequential_classifier_blocks_before_forwarding() {
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
 
+#[cfg(feature = "models")]
 #[tokio::test]
 async fn parallel_classifier_flags_the_forwarded_response() {
     let mock = start_mock().await;

@@ -1,6 +1,9 @@
 //! Runs the tiny fixture model (see fixtures/make_tiny.py): it scores a text
 //! as an attack when it contains the word "attack".
 
+// These tests run ONNX models, so they need the `onnx` feature.
+#![cfg(feature = "onnx")]
+
 use std::path::Path;
 
 use promptwall_classify::{Classifier, Options, Pair};

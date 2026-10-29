@@ -14,7 +14,7 @@
 
 ## Quick start
 
-Requires a recent stable Rust toolchain.
+Download `promptwall` for Windows, macOS or Linux from the [releases page](https://github.com/Promptwall/promptwall/releases), or use Docker or Helm; see [install](docs/install.md). From source, with a recent stable Rust toolchain:
 
 ```sh
 cargo run --release -p promptwall -- --listen 127.0.0.1:8080 --upstream https://api.openai.com
@@ -76,6 +76,7 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 
 | Document | What it covers |
 | --- | --- |
+| [Install](docs/install.md) | Downloads, Docker, Helm, building from source (with or without models) |
 | [Architecture](docs/architecture.md) | Components, request path, latency budget, deployment modes |
 | [Threat model](docs/specs/threat-model.md) | What the MVP protects against and what it does not |
 | [Policy format](docs/specs/policy-format.md) | The YAML policy language (version 1, stable) and its [JSON Schema](docs/specs/policy-v1.schema.json) |

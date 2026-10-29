@@ -1,1 +1,3 @@
 /target
+# Binaries staged for the release image (.github/workflows/release.yml)
+/docker

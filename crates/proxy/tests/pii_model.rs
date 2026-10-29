@@ -2,6 +2,9 @@
 //! with the tiny fixture model of crates/classify/tests/fixtures: it tags
 //! "anna" as the start of a person's name and "smith" as its continuation.
 
+// These tests load ONNX models, so they need the `models` feature.
+#![cfg(feature = "models")]
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;

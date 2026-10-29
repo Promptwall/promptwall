@@ -1,0 +1,126 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "promptwall.fullname" . }}
+  labels:
+    {{- include "promptwall.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "promptwall.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "promptwall.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- if .Values.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        # A new key needs a restart; policy changes do not.
+        checksum/policy-key: {{ .Values.policySigning.publicKey | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: promptwall
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --listen=0.0.0.0:8080
+            - --policy=/etc/promptwall/policy/policy.yaml
+            - --reload-interval={{ .Values.reloadInterval }}
+            {{- if .Values.metrics.enabled }}
+            - --metrics-listen=0.0.0.0:{{ .Values.metrics.port }}
+            {{- end }}
+            {{- if .Values.decisionLog.enabled }}
+            - --decision-log=-
+            {{- end }}
+            {{- if .Values.policySigning.publicKey }}
+            - --policy-public-key=/etc/promptwall/key/policy.pub
+            {{- end }}
+            {{- range $name := list "injection" "safety" "topics" "pii" }}
+            {{- if index $.Values.models $name }}
+            - --{{ $name | replace "topics" "topic" }}-model=/models/{{ $name }}
+            {{- end }}
+            {{- end }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: policy
+              mountPath: /etc/promptwall/policy
+              readOnly: true
+            {{- if .Values.policySigning.publicKey }}
+            - name: key
+              mountPath: /etc/promptwall/key
+              readOnly: true
+            {{- end }}
+            {{- if .Values.models.existingClaim }}
+            - name: models
+              mountPath: /models
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: policy
+          configMap:
+            name: {{ include "promptwall.policyConfigMap" . }}
+        {{- if .Values.policySigning.publicKey }}
+        - name: key
+          configMap:
+            name: {{ include "promptwall.fullname" . }}-policy-key
+        {{- end }}
+        {{- if .Values.models.existingClaim }}
+        - name: models
+          persistentVolumeClaim:
+            claimName: {{ .Values.models.existingClaim }}
+            readOnly: true
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

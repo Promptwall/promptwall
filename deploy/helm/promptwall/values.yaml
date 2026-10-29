@@ -1,0 +1,97 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/promptwall/promptwall
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The policy file (docs/specs/policy-format.md). Changes are applied by the
+# running pods within a minute (the time Kubernetes takes to update a mounted
+# ConfigMap), without a restart.
+policy: |
+  version: 1
+  upstreams:
+    openai:
+      url: https://api.openai.com
+  routes:
+    - name: openai
+      upstream: openai
+      input:
+        - detector: prompt_injection
+          action: block
+        - detector: secrets
+          action: block
+        - detector: pii
+          action: redact
+      output:
+        - detector: secrets
+          action: block
+        - detector: exfiltration
+          action: block
+
+# Use a ConfigMap you manage instead of `policy`. It must have the key
+# policy.yaml, and policy.yaml.sig when signing is on.
+existingPolicyConfigMap: ""
+
+# Seconds between checks of the policy file for changes; 0 turns reloading off.
+reloadInterval: 2
+
+# Only use policies signed with the matching private key (docs/policy-signing.md).
+policySigning:
+  # Contents of the .pub file from `promptwall keygen`. Empty: signing off.
+  publicKey: ""
+  # Contents of policy.yaml.sig, when the policy comes from `policy` above.
+  signature: ""
+
+metrics:
+  enabled: true
+  port: 9464
+
+# One JSON line per request on standard output, for your log shipper
+# (docs/monitoring.md). Promptwall's own logs go to standard error.
+decisionLog:
+  enabled: false
+
+# Tier 2 models (docs/models.md), from a volume that holds one directory per
+# model: injection, safety, topics, pii.
+models:
+  existingClaim: ""
+  injection: false
+  safety: false
+  topics: false
+  pii: false
+
+# More arguments and environment variables for the proxy.
+extraArgs: []
+env: []
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]

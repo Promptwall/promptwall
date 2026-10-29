@@ -19,7 +19,7 @@ hyper.workspace = true
 hyper-rustls.workspace = true
 schemars.workspace = true
 hyper-util.workspace = true
-promptwall-classify = { path = "../classify" }
+promptwall-classify = { path = "../classify", default-features = false }
 promptwall-detect = { path = "../detect" }
 ring.workspace = true
 rustls.workspace = true
@@ -29,6 +29,12 @@ serde_yaml_ng.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[features]
+default = ["models"]
+# Tier 2 models (--injection-model and the others) with ONNX Runtime. Without
+# it, every other check works and the binary needs no ONNX Runtime library.
+models = ["promptwall-classify/onnx"]
 
 [dev-dependencies]
 pw-mock-upstream = { path = "../mock-upstream" }

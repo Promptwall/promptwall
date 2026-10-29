@@ -1,0 +1,12 @@
+# The released image: the binaries built by .github/workflows/release.yml,
+# copied in per architecture instead of compiled again. For a local build
+# from source, use the Dockerfile at the repository root.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+# TLS roots are built into the binary (webpki-roots), so no CA package is needed.
+RUN useradd --system --uid 10001 promptwall
+COPY --chmod=755 docker/${TARGETARCH}/promptwall docker/${TARGETARCH}/pw-mock-upstream /usr/local/bin/
+USER promptwall
+ENV PROMPTWALL_LISTEN=0.0.0.0:8080
+EXPOSE 8080 9464
+ENTRYPOINT ["promptwall"]

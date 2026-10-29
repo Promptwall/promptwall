@@ -1,0 +1,9 @@
+Promptwall is running. Point your apps at it instead of the provider:
+
+  http://{{ include "promptwall.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+Edit the policy with `helm upgrade --set-file policy=policy.yaml` (or your own
+ConfigMap); the pods pick it up within a minute, without a restart.
+{{- if .Values.metrics.enabled }}
+Prometheus metrics: port {{ .Values.metrics.port }}, path /metrics.
+{{- end }}
