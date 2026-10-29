@@ -123,6 +123,7 @@ impl OutputCheck {
     }
 
     fn log(&self, action: Action, findings: &BTreeMap<String, usize>, streamed: bool) {
+        crate::metrics::findings(&self.route, "response", findings);
         tracing::info!(
             route = %self.route,
             action = action.as_str(),
@@ -220,6 +221,11 @@ pub async fn check(check: Arc<OutputCheck>, parts: Parts, body: Incoming) -> Res
 
 fn unscannable(check: &OutputCheck, parts: Parts, body: ProxyBody) -> Response<ProxyBody> {
     tracing::warn!(route = %check.route, fail_closed = check.fail_closed, "response could not be inspected");
+    crate::metrics::count(
+        "promptwall_uninspected_total",
+        &[("route", &check.route), ("direction", "response")],
+        1,
+    );
     if check.fail_closed && !check.shadow {
         return json_error(
             StatusCode::BAD_GATEWAY,

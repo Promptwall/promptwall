@@ -1,0 +1,52 @@
+# Promptwall with Prometheus and a Grafana dashboard of its metrics.
+#   docker compose up --build              # proxy on :8080, Grafana on :3000
+#   docker compose --profile demo up --build   # plus sample traffic
+# The policy in policy.yaml sends requests to a mock provider, so no API key
+# is needed. Edit it to use OpenAI, Anthropic or Ollama instead.
+services:
+  promptwall:
+    build: ../..
+    image: promptwall:local
+    environment:
+      PROMPTWALL_POLICY: /etc/promptwall/policy.yaml
+      PROMPTWALL_METRICS_LISTEN: 0.0.0.0:9464
+    volumes:
+      - ./policy.yaml:/etc/promptwall/policy.yaml:ro
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Ollama on the host
+    depends_on: [mock]
+
+  mock:
+    image: promptwall:local
+    entrypoint: ["pw-mock-upstream", "--listen", "0.0.0.0:9000", "--delay-ms", "150"]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/promptwall.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+
+  # Sends a mix of normal, sensitive and malicious prompts every second.
+  traffic:
+    profiles: [demo]
+    image: curlimages/curl:8.15.0
+    entrypoint: ["/bin/sh", "/traffic.sh"]
+    volumes:
+      - ./traffic.sh:/traffic.sh:ro
+    depends_on: [promptwall]

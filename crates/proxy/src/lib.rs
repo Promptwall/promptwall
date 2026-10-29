@@ -8,6 +8,7 @@
 pub mod init;
 pub mod inspect;
 pub mod limits;
+pub mod metrics;
 pub mod moderation;
 pub mod ner;
 pub mod output;
@@ -190,6 +191,37 @@ impl Proxy {
         if req.uri().path() == "/healthz" {
             return Ok(text(StatusCode::OK, "ok\n"));
         }
+        let started = Instant::now();
+        let route = self
+            .inner
+            .policy
+            .route(req.uri().path(), req.headers())
+            .map_or_else(String::new, |r| r.name.clone());
+        let resp = self.handle_request(req).await?;
+        let action = match (resp.status(), resp.headers().get(ACTION_HEADER)) {
+            (StatusCode::TOO_MANY_REQUESTS, _) => "rate_limited",
+            (StatusCode::NOT_FOUND, _) if route.is_empty() => "no_route",
+            (_, Some(v)) => v.to_str().unwrap_or("allow"),
+            (StatusCode::BAD_GATEWAY, None) => "error",
+            _ => "allow",
+        };
+        metrics::count(
+            "promptwall_requests_total",
+            &[("route", &route), ("action", action)],
+            1,
+        );
+        metrics::observe(
+            "promptwall_request_duration_seconds",
+            &[("route", &route)],
+            started.elapsed(),
+        );
+        Ok(resp)
+    }
+
+    async fn handle_request(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<ProxyBody>, Infallible> {
         let Some(route) = self.inner.policy.route(req.uri().path(), req.headers()) else {
             return Ok(json_error(
                 StatusCode::NOT_FOUND,
@@ -284,6 +316,7 @@ impl Proxy {
         };
         let output_safety = route.output.as_ref().and_then(|o| o.safety.clone());
         let leak_words = route.output.as_ref().and_then(|o| o.leak_words);
+        let checking = Instant::now();
         let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
             Err(inspect::Unscannable)
         } else {
@@ -298,6 +331,11 @@ impl Proxy {
                 &route.except,
             )
         };
+        metrics::observe(
+            "promptwall_check_duration_seconds",
+            &[("route", &route.name), ("stage", "rules")],
+            checking.elapsed(),
+        );
         let mut outcome = match outcome {
             Ok(mut outcome) => {
                 if let Some(rules) = &route.tools {
@@ -338,8 +376,15 @@ impl Proxy {
                     .redacted_body
                     .clone()
                     .unwrap_or_else(|| body.clone());
+                let tagging = Instant::now();
                 let task = tokio::task::spawn_blocking(move || tag_body(&model, &rule, &current));
-                match task.await {
+                let tagged = task.await;
+                metrics::observe(
+                    "promptwall_check_duration_seconds",
+                    &[("route", &route.name), ("stage", "models")],
+                    tagging.elapsed(),
+                );
+                match tagged {
                     Ok(Ok((tagged, new_body))) => add_tagged(&mut outcome, tagged, new_body),
                     Ok(Err(err)) => {
                         tracing::warn!(route = %route.name, error = %format!("{err:#}"), "PII model failed");
@@ -449,6 +494,11 @@ impl Proxy {
         parts: http::request::Parts,
         body: Bytes,
     ) -> Response<ProxyBody> {
+        metrics::count(
+            "promptwall_uninspected_total",
+            &[("route", &route.name), ("direction", "request")],
+            1,
+        );
         if route.fail_mode == FailMode::Closed && !route.shadow {
             return uninspectable();
         }
@@ -491,6 +541,7 @@ impl Proxy {
             }
             Err(err) => {
                 tracing::warn!(error = %err, "upstream request failed");
+                metrics::count("promptwall_upstream_errors_total", &[], 1);
                 text(StatusCode::BAD_GATEWAY, "upstream unavailable\n")
             }
         }
@@ -797,6 +848,11 @@ async fn tier2_verdict(
 ) -> Option<ModelFindings> {
     match task.await {
         Ok(Ok((found, elapsed))) => {
+            metrics::observe(
+                "promptwall_check_duration_seconds",
+                &[("route", &route.name), ("stage", "models")],
+                elapsed,
+            );
             tracing::debug!(route = %route.name, ?found, elapsed_us = elapsed.as_micros() as u64, "tier 2 models");
             Some(found)
         }
@@ -819,6 +875,7 @@ fn add_model_findings(outcome: &mut inspect::Outcome, found: &[(String, Action)]
 }
 
 fn log_findings(route: &policy::Route, action: Action, outcome: &inspect::Outcome) {
+    metrics::findings(&route.name, "request", &outcome.findings);
     tracing::info!(
         route = %route.name,
         action = action.as_str(),

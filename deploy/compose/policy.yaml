@@ -1,0 +1,28 @@
+# Demo policy for docker compose. The upstream is the mock provider; for a
+# real one, change the url, for example:
+#   https://api.openai.com
+#   http://host.docker.internal:11434      (Ollama on this machine)
+version: 1
+upstreams:
+  llm:
+    url: http://mock:9000
+routes:
+  - name: chat
+    upstream: llm
+    input:
+      - detector: prompt_injection
+        action: block
+      - detector: secrets
+        action: block
+      - detector: pii
+        action: redact
+    output:
+      - detector: secrets
+        action: block
+      - detector: pii
+        action: redact
+      - detector: exfiltration
+        action: block
+    limits:
+      key: header:x-user
+      requests_per_minute: 60
