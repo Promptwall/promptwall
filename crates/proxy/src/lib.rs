@@ -13,11 +13,12 @@ pub mod moderation;
 pub mod ner;
 pub mod output;
 pub mod policy;
+pub mod reload;
 pub mod tools;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -70,7 +71,8 @@ pub struct Proxy {
 }
 
 struct Inner {
-    policy: Policy,
+    /// Swapped as a whole on reload; each request keeps the one it started with.
+    policy: RwLock<Arc<Policy>>,
     models: Models,
     client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
@@ -104,64 +106,7 @@ impl Proxy {
     /// Like [`Proxy::with_policy`], with Tier 2 models. Fails when a route
     /// needs a model that is not loaded.
     pub fn with_models(policy: Policy, models: Models) -> anyhow::Result<Self> {
-        for route in &policy.routes {
-            let name = &route.name;
-            if models.injection.is_none() && route.threshold.is_some() {
-                anyhow::bail!(
-                    "route {name:?} sets a prompt_injection threshold, but no injection model is loaded (--injection-model)"
-                );
-            }
-            let output_safety = route.output.as_ref().and_then(|o| o.safety.as_ref());
-            for rule in route.safety.iter().chain(output_safety) {
-                let Some(model) = &models.safety else {
-                    anyhow::bail!(
-                        "route {name:?} uses content_safety, but no safety model is loaded (--safety-model)"
-                    );
-                };
-                let known: Vec<&str> = model.categories().collect();
-                if let Some(unknown) = rule
-                    .categories
-                    .iter()
-                    .find(|c| !known.contains(&c.as_str()))
-                {
-                    anyhow::bail!(
-                        "route {name:?}: the safety model has no category {unknown:?}; it has {}",
-                        known.join(", ")
-                    );
-                }
-            }
-            if route.topics.is_some() && models.topics.is_none() {
-                anyhow::bail!(
-                    "route {name:?} uses topics, but no topic model is loaded (--topic-model)"
-                );
-            }
-            let output_pii = route.output.as_ref().and_then(|o| o.pii.as_ref());
-            for rule in route.pii.iter().chain(output_pii) {
-                let builtin = || {
-                    Kind::ALL
-                        .iter()
-                        .filter(|k| k.category() == promptwall_detect::Category::Pii)
-                        .map(|k| k.entity())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let Some(model) = &models.pii else {
-                    let entity = rule.entities.keys().next().map_or("", String::as_str);
-                    anyhow::bail!(
-                        "route {name:?}: unknown pii entity {entity:?}. Built in: {}. Names, addresses and other entities need a PII model (--pii-model)",
-                        builtin()
-                    );
-                };
-                if let Some(unknown) = rule.entities.keys().find(|e| !model.entities().contains(e))
-                {
-                    anyhow::bail!(
-                        "route {name:?}: unknown pii entity {unknown:?}. Built in: {}. The PII model has: {}",
-                        builtin(),
-                        model.entities().join(", ")
-                    );
-                }
-            }
-        }
+        check_models(&policy, &models)?;
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
         http.enforce_http(false);
@@ -179,11 +124,42 @@ impl Proxy {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                policy,
+                policy: RwLock::new(Arc::new(policy)),
                 models,
                 client,
             }),
         })
+    }
+
+    /// The policy in force.
+    pub fn policy(&self) -> Arc<Policy> {
+        self.inner
+            .policy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Replaces the policy. Requests already running finish under the old
+    /// one. Fails, and keeps the old policy, when the new one needs a model
+    /// that is not loaded. Rate-limit counters carry over for routes whose
+    /// name and limits are unchanged.
+    pub fn reload(&self, mut policy: Policy) -> anyhow::Result<()> {
+        check_models(&policy, &self.inner.models)?;
+        let old = self.policy();
+        for route in &mut policy.routes {
+            let kept = old
+                .routes
+                .iter()
+                .find(|r| r.name == route.name)
+                .and_then(|r| r.limits.as_ref())
+                .filter(|l| route.limits.as_ref().is_some_and(|n| n.limits == l.limits));
+            if let Some(limiter) = kept {
+                route.limits = Some(limiter.clone());
+            }
+        }
+        *self.inner.policy.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(policy);
+        Ok(())
     }
 
     /// Handles one request. Never fails: errors become an HTTP error response.
@@ -193,8 +169,7 @@ impl Proxy {
         }
         let started = Instant::now();
         let route = self
-            .inner
-            .policy
+            .policy()
             .route(req.uri().path(), req.headers())
             .map_or_else(String::new, |r| r.name.clone());
         let resp = self.handle_request(req).await?;
@@ -222,7 +197,8 @@ impl Proxy {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<ProxyBody>, Infallible> {
-        let Some(route) = self.inner.policy.route(req.uri().path(), req.headers()) else {
+        let policy = self.policy();
+        let Some(route) = policy.route(req.uri().path(), req.headers()) else {
             return Ok(json_error(
                 StatusCode::NOT_FOUND,
                 "promptwall_no_route",
@@ -551,9 +527,8 @@ impl Proxy {
     /// anything, for policy tests and `promptwall scan`. A prompt is checked
     /// as the user message of a chat request. Blocking: the models run inline.
     pub fn check(&self, route: &str, sample: Sample) -> anyhow::Result<Verdict> {
-        let route = self
-            .inner
-            .policy
+        let policy = self.policy();
+        let route = policy
             .routes
             .iter()
             .find(|r| r.name == route)
@@ -629,8 +604,7 @@ impl Proxy {
     /// Runs the test cases of the policy (its `tests` section). Blocking,
     /// like [`Proxy::check`].
     pub fn run_tests(&self) -> Vec<TestResult> {
-        self.inner
-            .policy
+        self.policy()
             .tests
             .iter()
             .map(|test| {
@@ -1004,4 +978,66 @@ fn text(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     resp
+}
+
+/// Fails when a route of `policy` needs a model that is not loaded.
+fn check_models(policy: &Policy, models: &Models) -> anyhow::Result<()> {
+    for route in &policy.routes {
+        let name = &route.name;
+        if models.injection.is_none() && route.threshold.is_some() {
+            anyhow::bail!(
+                "route {name:?} sets a prompt_injection threshold, but no injection model is loaded (--injection-model)"
+            );
+        }
+        let output_safety = route.output.as_ref().and_then(|o| o.safety.as_ref());
+        for rule in route.safety.iter().chain(output_safety) {
+            let Some(model) = &models.safety else {
+                anyhow::bail!(
+                    "route {name:?} uses content_safety, but no safety model is loaded (--safety-model)"
+                );
+            };
+            let known: Vec<&str> = model.categories().collect();
+            if let Some(unknown) = rule
+                .categories
+                .iter()
+                .find(|c| !known.contains(&c.as_str()))
+            {
+                anyhow::bail!(
+                    "route {name:?}: the safety model has no category {unknown:?}; it has {}",
+                    known.join(", ")
+                );
+            }
+        }
+        if route.topics.is_some() && models.topics.is_none() {
+            anyhow::bail!(
+                "route {name:?} uses topics, but no topic model is loaded (--topic-model)"
+            );
+        }
+        let output_pii = route.output.as_ref().and_then(|o| o.pii.as_ref());
+        for rule in route.pii.iter().chain(output_pii) {
+            let builtin = || {
+                Kind::ALL
+                    .iter()
+                    .filter(|k| k.category() == promptwall_detect::Category::Pii)
+                    .map(|k| k.entity())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let Some(model) = &models.pii else {
+                let entity = rule.entities.keys().next().map_or("", String::as_str);
+                anyhow::bail!(
+                    "route {name:?}: unknown pii entity {entity:?}. Built in: {}. Names, addresses and other entities need a PII model (--pii-model)",
+                    builtin()
+                );
+            };
+            if let Some(unknown) = rule.entities.keys().find(|e| !model.entities().contains(e)) {
+                anyhow::bail!(
+                    "route {name:?}: unknown pii entity {unknown:?}. Built in: {}. The PII model has: {}",
+                    builtin(),
+                    model.entities().join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
 }
