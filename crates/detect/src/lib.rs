@@ -1,5 +1,7 @@
 //! Tier 1 detectors: pattern-based PII, secret and prompt-injection detection,
 //! and checks on model output (exfiltration links, system prompt leaks).
+//! [`Detector::scan_evasions`] finds injections hidden by encoding, look-alike
+//! characters or spacing.
 //!
 //! Every detector is a regular expression plus a validator (a checksum, a
 //! valid range) that removes false positives, and for generic formats a
@@ -12,6 +14,7 @@
 //! The crate does no I/O and has no async code so that it can be compiled to
 //! WebAssembly and run inside the npm package as well as the proxy.
 
+mod evasion;
 mod leak;
 mod rules;
 
@@ -64,6 +67,16 @@ pub enum Kind {
     PromptExtraction,
     ChatTemplate,
     HiddenText,
+    /// Instructions aimed at an AI inside content it reads: a web page, an
+    /// email or tool output ("if you are an AI reading this", "do not tell the
+    /// user").
+    IndirectInstruction,
+    /// An injection hidden by encoding, look-alike characters or spacing; see
+    /// [`Detector::scan_evasions`].
+    Obfuscated,
+    /// A long written-out dialogue in one message that primes the model to
+    /// answer anything (many-shot jailbreak).
+    ManyShot,
     /// Verdict of the Tier 2 injection classifier. This crate never reports it;
     /// it exists so policies can name it next to the pattern-based kinds.
     InjectionClassifier,
@@ -94,7 +107,7 @@ pub enum Category {
 
 impl Kind {
     /// All built-in kinds.
-    pub const ALL: [Kind; 42] = [
+    pub const ALL: [Kind; 45] = [
         Kind::Email,
         Kind::Phone,
         Kind::Iban,
@@ -132,6 +145,9 @@ impl Kind {
         Kind::PromptExtraction,
         Kind::ChatTemplate,
         Kind::HiddenText,
+        Kind::IndirectInstruction,
+        Kind::Obfuscated,
+        Kind::ManyShot,
         Kind::InjectionClassifier,
         Kind::MarkdownImage,
         Kind::HtmlImage,
@@ -161,6 +177,9 @@ impl Kind {
             | Kind::PromptExtraction
             | Kind::ChatTemplate
             | Kind::HiddenText
+            | Kind::IndirectInstruction
+            | Kind::Obfuscated
+            | Kind::ManyShot
             | Kind::InjectionClassifier => Category::Injection,
             Kind::MarkdownImage | Kind::HtmlImage | Kind::UrlWithData => Category::Exfiltration,
             Kind::SystemPromptLeak => Category::Leak,
@@ -210,6 +229,9 @@ impl Kind {
             Kind::PromptExtraction => "prompt_extraction",
             Kind::ChatTemplate => "chat_template",
             Kind::HiddenText => "hidden_text",
+            Kind::IndirectInstruction => "indirect",
+            Kind::Obfuscated => "obfuscated",
+            Kind::ManyShot => "many_shot",
             Kind::InjectionClassifier => "classifier",
             Kind::MarkdownImage => "markdown_image",
             Kind::HtmlImage => "html_image",
@@ -366,9 +388,16 @@ impl Builder {
                 grouped: false,
             });
         }
+        let injection_rules: Vec<usize> = (0..RULES.len())
+            .filter(|&i| RULES[i].kind.category() == Category::Injection)
+            .collect();
+        let injection_set = RegexSet::new(injection_rules.iter().map(|&i| &sources[i]))
+            .expect("patterns were validated");
         Detector {
             set,
             rules,
+            injection_set,
+            injection_rules,
             custom_names: self.custom.into_iter().map(|(n, _)| n).collect(),
         }
     }
@@ -391,6 +420,9 @@ fn check_name(name: &str) -> Result<(), BuildError> {
 pub struct Detector {
     set: RegexSet,
     rules: Vec<Rule>,
+    /// The injection rules alone, for the evasion checks; indices into `rules`.
+    injection_set: RegexSet,
+    injection_rules: Vec<usize>,
     custom_names: Vec<String>,
 }
 
@@ -421,8 +453,19 @@ impl Detector {
 
     /// Finds all sensitive values in `text`, sorted by position, without overlaps.
     pub fn scan(&self, text: &str) -> Vec<Finding> {
+        self.find(&self.set, None, text)
+    }
+
+    /// Like [`Detector::scan`] with the injection rules only.
+    fn scan_injection(&self, text: &str) -> Vec<Finding> {
+        self.find(&self.injection_set, Some(&self.injection_rules), text)
+    }
+
+    /// Runs the rules that `set` matches; `rules` maps set indices to rules.
+    fn find(&self, set: &RegexSet, rules: Option<&[usize]>, text: &str) -> Vec<Finding> {
         let mut found = Vec::new();
-        for idx in self.set.matches(text).iter() {
+        for idx in set.matches(text).iter() {
+            let idx = rules.map_or(idx, |r| r[idx]);
             let rule = &self.rules[idx];
             let mut consider = |start: usize, value: &str| {
                 let Some(len) = (rule.validate)(value) else {

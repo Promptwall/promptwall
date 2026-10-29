@@ -2,7 +2,7 @@
 
 **An open source AI firewall.** Promptwall sits between your application and any LLM and blocks prompt injection, jailbreaks and data leaks in both directions, while adding only single-digit milliseconds of latency.
 
-> **Status: early Phase 1.** Promptwall routes requests by a YAML policy and can block secrets and redact personal data in prompts (pattern-based, Tier 1). It blocks prompt injection (patterns plus an optional ONNX classifier) and checks the provider's answers, streamed or not, for leaked secrets, personal data, exfiltration links and system-prompt leaks.
+> **Status: early Phase 1.** Promptwall routes requests by a YAML policy and can block secrets and redact personal data in prompts (pattern-based, Tier 1). It blocks prompt injection, including encoded and disguised attacks, many-shot jailbreaks and instructions planted in documents (patterns plus an optional ONNX classifier), and checks the provider's answers, streamed or not, for leaked secrets, personal data, exfiltration links and system-prompt leaks.
 
 ## Goals
 
@@ -28,7 +28,7 @@ To inspect requests, start it with a policy instead:
 cargo run --release -p promptwall -- --policy examples/policy.yaml
 ```
 
-With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, prompt-injection phrasing ("ignore all previous instructions", hidden Unicode, forged chat tokens) is blocked, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
+With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, prompt-injection phrasing ("ignore all previous instructions", also as base64, leetspeak or look-alike letters; hidden Unicode, forged chat tokens) is blocked, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
 
 To measure the latency the proxy adds:
 
