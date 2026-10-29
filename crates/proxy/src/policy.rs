@@ -12,7 +12,7 @@ use anyhow::{bail, ensure, Context};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::uri::{Authority, Scheme};
 use http::Uri;
-use promptwall_detect::{Category, Kind};
+use promptwall_detect::{Category, Detector, Kind};
 use serde::Deserialize;
 
 /// What happens when a detector finds something. Ordered by severity.
@@ -72,6 +72,8 @@ pub struct Route {
     /// Action per finding kind on the request. Empty means the request body is
     /// streamed through without inspection.
     pub input: HashMap<Kind, Action>,
+    /// Built-in detectors plus this route's custom patterns and keyword lists.
+    pub detector: Arc<Detector>,
 }
 
 impl Route {
@@ -127,6 +129,7 @@ impl Policy {
                 fail_mode: FailMode::Open,
                 shadow: false,
                 input: HashMap::new(),
+                detector: Arc::new(Detector::new()),
             }],
         })
     }
@@ -172,7 +175,7 @@ impl Policy {
                     Ok((k, v))
                 })
                 .collect::<anyhow::Result<_>>()?;
-            let input =
+            let (input, detector) =
                 compile_detectors(&spec.input).with_context(|| format!("route {name:?}"))?;
             routes.push(Route {
                 path_prefix: spec.matcher.path,
@@ -184,6 +187,7 @@ impl Policy {
                     .unwrap_or_default(),
                 shadow: spec.shadow.or(file.defaults.shadow).unwrap_or(false),
                 input,
+                detector: Arc::new(detector),
                 name,
             });
         }
@@ -195,14 +199,37 @@ impl Policy {
     }
 }
 
-/// Maps each finding kind to the action of the first detector entry that covers it.
-fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<HashMap<Kind, Action>> {
+/// Maps each finding kind to the action of the first detector entry that covers
+/// it, and builds the detector with the route's custom patterns and keyword lists.
+fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<(HashMap<Kind, Action>, Detector)> {
     let mut actions = HashMap::new();
+    let mut builder = Detector::builder();
     for spec in specs {
         let category = match spec.detector {
             DetectorName::Pii => Category::Pii,
             DetectorName::Secrets => Category::Secret,
+            DetectorName::Custom => {
+                let name = spec
+                    .name
+                    .as_deref()
+                    .context("a custom detector needs a name")?;
+                ensure!(
+                    spec.entities.is_empty(),
+                    "custom detector {name:?} cannot list entities"
+                );
+                let kind = match (&spec.pattern, &spec.keywords) {
+                    (Some(pattern), None) => builder.pattern(name, pattern)?,
+                    (None, Some(words)) => builder.keywords(name, words)?,
+                    _ => bail!("custom detector {name:?} needs either pattern or keywords"),
+                };
+                actions.entry(kind).or_insert(spec.action);
+                continue;
+            }
         };
+        ensure!(
+            spec.name.is_none() && spec.pattern.is_none() && spec.keywords.is_none(),
+            "name, pattern and keywords are only allowed on custom detectors"
+        );
         let kinds: Vec<Kind> = if spec.entities.is_empty() {
             Kind::ALL
                 .into_iter()
@@ -227,7 +254,7 @@ fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<HashMap<Kind, Act
             actions.entry(kind).or_insert(spec.action);
         }
     }
-    Ok(actions)
+    Ok((actions, builder.build()))
 }
 
 #[derive(Deserialize)]
@@ -280,6 +307,12 @@ struct DetectorFile {
     detector: DetectorName,
     #[serde(default)]
     entities: Vec<String>,
+    /// Custom detectors only: the name used in logs and redaction markers.
+    name: Option<String>,
+    /// Custom detectors only: a regular expression.
+    pattern: Option<String>,
+    /// Custom detectors only: case-insensitive words or phrases.
+    keywords: Option<Vec<String>>,
     action: Action,
 }
 
@@ -288,6 +321,7 @@ struct DetectorFile {
 enum DetectorName {
     Pii,
     Secrets,
+    Custom,
 }
 
 #[cfg(test)]
@@ -315,6 +349,10 @@ routes:
         action: redact
       - detector: pii
         action: flag
+      - detector: custom
+        name: employee_id
+        pattern: 'EMP-[0-9]{6}'
+        action: redact
   - name: everything-else
     upstream: local
     shadow: true
@@ -330,6 +368,9 @@ routes:
         assert_eq!(bot.input[&Kind::Email], Action::Redact);
         // Not listed in the redact entry, so the later catch-all flag applies.
         assert_eq!(bot.input[&Kind::Phone], Action::Flag);
+        let custom = bot.detector.scan("ticket EMP-123456");
+        assert_eq!(bot.detector.label(custom[0].kind), "custom.employee_id");
+        assert_eq!(bot.input[&custom[0].kind], Action::Redact);
         let rest = &policy.routes[1];
         assert!(rest.shadow && !rest.inspects_input());
     }
@@ -370,6 +411,23 @@ routes:
         ))
         .contains("unknown field"));
         assert!(err("version: 2\nupstreams: {}\nroutes: []").contains("unsupported policy version"));
+        let custom = |detector: &str| {
+            err(&format!(
+                "{base}routes: [{{ name: r, upstream: a, input: [{detector}] }}]"
+            ))
+        };
+        assert!(custom("{ detector: custom, name: x, action: block }")
+            .contains("either pattern or keywords"));
+        assert!(
+            custom("{ detector: custom, name: x, pattern: '(', action: block }")
+                .contains("invalid pattern")
+        );
+        assert!(
+            custom("{ detector: custom, name: X, keywords: [a], action: block }")
+                .contains("invalid custom detector name")
+        );
+        assert!(custom("{ detector: pii, pattern: 'x', action: block }")
+            .contains("only allowed on custom"));
         assert!(err("version: 1\nupstreams: { a: { url: 'http://x/v1' } }\nroutes: [{ name: r, upstream: a }]")
             .contains("must not include a path"));
     }

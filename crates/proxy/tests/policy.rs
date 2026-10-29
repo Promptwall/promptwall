@@ -198,3 +198,46 @@ async fn unmatched_requests_get_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert_eq!(json(resp).await["error"]["type"], "promptwall_no_route");
 }
+
+#[tokio::test]
+async fn custom_patterns_and_keyword_lists() {
+    let mock = start_mock().await;
+    let yaml = format!(
+        r#"
+version: 1
+upstreams:
+  mock: {{ url: "http://{mock}" }}
+routes:
+  - name: chat
+    upstream: mock
+    input:
+      - detector: custom
+        name: employee_id
+        pattern: 'EMP-[0-9]{{6}}'
+        action: redact
+      - detector: custom
+        name: project_names
+        keywords: [Project Falcon]
+        action: block
+"#
+    );
+    let proxy = start_proxy(&yaml).await;
+
+    let resp = send(proxy, "Ticket for EMP-123456 please", &[]).await;
+    assert_eq!(action(&resp), Some("redact"));
+    assert_eq!(
+        json(resp).await["messages"][0]["content"],
+        "Ticket for [REDACTED:EMPLOYEE_ID] please"
+    );
+
+    let resp = send(proxy, "Summarise the project falcon roadmap", &[]).await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        json(resp).await["error"]["findings"],
+        serde_json::json!(["custom.project_names"])
+    );
+
+    // Built-in detectors are not active unless the route lists them.
+    let resp = send(proxy, "mail jane@example.com", &[]).await;
+    assert_eq!(action(&resp), None);
+}

@@ -27,7 +27,6 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use promptwall_detect::Detector;
 use tokio::net::TcpListener;
 
 pub use policy::Policy;
@@ -62,7 +61,6 @@ pub struct Proxy {
 
 struct Inner {
     policy: Policy,
-    detector: Detector,
     client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
 
@@ -90,11 +88,7 @@ impl Proxy {
             .build(https);
 
         Ok(Self {
-            inner: Arc::new(Inner {
-                policy,
-                detector: Detector::new(),
-                client,
-            }),
+            inner: Arc::new(Inner { policy, client }),
         })
     }
 
@@ -159,7 +153,7 @@ impl Proxy {
         let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
             Err(inspect::Unscannable)
         } else {
-            inspect::inspect(&self.inner.detector, &route.input, &body)
+            inspect::inspect(&route.detector, &route.input, &body)
         };
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -180,7 +174,7 @@ impl Proxy {
         let Some(action) = outcome.action else {
             return Ok(self.forward(with_body(parts, body), None).await);
         };
-        let kinds: Vec<String> = outcome.findings.keys().map(|k| k.id()).collect();
+        let kinds: Vec<String> = outcome.findings.keys().cloned().collect();
         tracing::info!(
             route = %route.name,
             action = action.as_str(),
