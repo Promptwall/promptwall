@@ -35,6 +35,9 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 ## Known limits
 
 - No detector catches every injection. Promptwall reduces risk and gives visibility; it is one layer, not a guarantee. Docs must say this plainly.
+- Injection patterns (Tier 1) only catch known phrasings and also match a prompt that quotes an attack to discuss it. On public test sets they catch 3 to 30% of attacks with no false positives; the classifier (Tier 2) catches 68 to 89% with up to 4% false positives ([models](../models.md)).
+- In the default parallel mode, an injection prompt reaches the provider before the classifier blocks it; only the answer is withheld. Tools that run on the provider side can act in that window, so such routes need `parallel: false`.
+- The app's own system prompt is trusted and not checked for injection. Indirect injection through retrieved content is only caught where that content arrives as user or tool text; marking untrusted spans explicitly comes later.
 - Pattern-based PII detection finds structured data: emails, international phone numbers, IBANs, card numbers, BIC and VAT numbers, several national IDs (DE, NL, ES, IT, FR, PL, UK, US) and IP addresses, plus company-specific patterns and keyword lists. It does not find names, addresses, free-text health data or national phone formats; those need the ML tier. Generic numeric IDs are only reported next to a context keyword, so an unlabelled tax ID is missed by design to avoid false positives.
 - Encodings and languages: MVP normalizes Unicode, invisible characters and base64; non-English coverage is best-effort until the multilingual model ships.
 - Content a provider sees before the firewall decides (optimistic forwarding) is never released to the user if a check fails, but it has been sent upstream. Routes handling sensitive data must disable optimistic forwarding.

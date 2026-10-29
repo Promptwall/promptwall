@@ -74,7 +74,16 @@ pub struct Route {
     pub input: HashMap<Kind, Action>,
     /// Built-in detectors plus this route's custom patterns and keyword lists.
     pub detector: Arc<Detector>,
+    /// Classifier score at or above which a prompt counts as an injection, if
+    /// the policy sets one.
+    pub threshold: Option<f32>,
+    /// Whether the classifier runs while the request is already on its way to
+    /// the provider (only the response waits for it), or before forwarding.
+    pub classifier_parallel: bool,
 }
+
+/// Classifier threshold when the policy does not set one.
+pub const DEFAULT_THRESHOLD: f32 = 0.5;
 
 impl Route {
     pub fn matches(&self, path: &str, headers: &HeaderMap) -> bool {
@@ -89,6 +98,16 @@ impl Route {
 
     pub fn inspects_input(&self) -> bool {
         !self.input.is_empty()
+    }
+
+    /// Threshold and action for the injection classifier, if this route uses it.
+    /// The classifier cannot point at a span to redact, so redact blocks.
+    pub fn classifier(&self) -> Option<(f32, Action)> {
+        let action = match self.input.get(&Kind::InjectionClassifier)? {
+            Action::Redact => Action::Block,
+            action => *action,
+        };
+        Some((self.threshold.unwrap_or(DEFAULT_THRESHOLD), action))
     }
 }
 
@@ -130,6 +149,8 @@ impl Policy {
                 shadow: false,
                 input: HashMap::new(),
                 detector: Arc::new(Detector::new()),
+                threshold: None,
+                classifier_parallel: true,
             }],
         })
     }
@@ -175,8 +196,12 @@ impl Policy {
                     Ok((k, v))
                 })
                 .collect::<anyhow::Result<_>>()?;
-            let (input, detector) =
-                compile_detectors(&spec.input).with_context(|| format!("route {name:?}"))?;
+            let Compiled {
+                actions: input,
+                detector,
+                threshold,
+                parallel,
+            } = compile_detectors(&spec.input).with_context(|| format!("route {name:?}"))?;
             routes.push(Route {
                 path_prefix: spec.matcher.path,
                 headers,
@@ -188,6 +213,8 @@ impl Policy {
                 shadow: spec.shadow.or(file.defaults.shadow).unwrap_or(false),
                 input,
                 detector: Arc::new(detector),
+                threshold,
+                classifier_parallel: parallel.unwrap_or(true),
                 name,
             });
         }
@@ -199,15 +226,44 @@ impl Policy {
     }
 }
 
+struct Compiled {
+    actions: HashMap<Kind, Action>,
+    detector: Detector,
+    threshold: Option<f32>,
+    parallel: Option<bool>,
+}
+
 /// Maps each finding kind to the action of the first detector entry that covers
 /// it, and builds the detector with the route's custom patterns and keyword lists.
-fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<(HashMap<Kind, Action>, Detector)> {
+/// Also returns the classifier settings, if any are set.
+fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<Compiled> {
     let mut actions = HashMap::new();
     let mut builder = Detector::builder();
+    let mut threshold = None;
+    let mut parallel = None;
     for spec in specs {
+        if let Some(p) = spec.parallel {
+            ensure!(
+                matches!(spec.detector, DetectorName::PromptInjection),
+                "parallel is only allowed on the prompt_injection detector"
+            );
+            parallel.get_or_insert(p);
+        }
+        if let Some(t) = spec.threshold {
+            ensure!(
+                matches!(spec.detector, DetectorName::PromptInjection),
+                "threshold is only allowed on the prompt_injection detector"
+            );
+            ensure!(
+                (0.0..=1.0).contains(&t),
+                "threshold must be between 0 and 1"
+            );
+            threshold.get_or_insert(t);
+        }
         let category = match spec.detector {
             DetectorName::Pii => Category::Pii,
             DetectorName::Secrets => Category::Secret,
+            DetectorName::PromptInjection => Category::Injection,
             DetectorName::Custom => {
                 let name = spec
                     .name
@@ -254,7 +310,12 @@ fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<(HashMap<Kind, Ac
             actions.entry(kind).or_insert(spec.action);
         }
     }
-    Ok((actions, builder.build()))
+    Ok(Compiled {
+        actions,
+        detector: builder.build(),
+        threshold,
+        parallel,
+    })
 }
 
 #[derive(Deserialize)]
@@ -313,6 +374,11 @@ struct DetectorFile {
     pattern: Option<String>,
     /// Custom detectors only: case-insensitive words or phrases.
     keywords: Option<Vec<String>>,
+    /// prompt_injection only: classifier score from 0 to 1 at which it fires.
+    threshold: Option<f32>,
+    /// prompt_injection only: run the classifier while the request is forwarded
+    /// (default) or before.
+    parallel: Option<bool>,
     action: Action,
 }
 
@@ -321,6 +387,7 @@ struct DetectorFile {
 enum DetectorName {
     Pii,
     Secrets,
+    PromptInjection,
     Custom,
 }
 
@@ -428,6 +495,12 @@ routes:
         );
         assert!(custom("{ detector: pii, pattern: 'x', action: block }")
             .contains("only allowed on custom"));
+        assert!(custom("{ detector: pii, threshold: 0.9, action: block }")
+            .contains("only allowed on the prompt_injection"));
+        assert!(
+            custom("{ detector: prompt_injection, threshold: 2, action: block }")
+                .contains("between 0 and 1")
+        );
         assert!(err("version: 1\nupstreams: { a: { url: 'http://x/v1' } }\nroutes: [{ name: r, upstream: a }]")
             .contains("must not include a path"));
     }

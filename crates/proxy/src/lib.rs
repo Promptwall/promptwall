@@ -11,7 +11,7 @@ pub mod policy;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -27,6 +27,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use promptwall_classify::Classifier;
+use promptwall_detect::Kind;
 use tokio::net::TcpListener;
 
 pub use policy::Policy;
@@ -61,6 +63,7 @@ pub struct Proxy {
 
 struct Inner {
     policy: Policy,
+    classifier: Option<Arc<Classifier>>,
     client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
 
@@ -72,6 +75,23 @@ impl Proxy {
     }
 
     pub fn with_policy(policy: Policy) -> anyhow::Result<Self> {
+        Self::with_classifier(policy, None)
+    }
+
+    /// Like [`Proxy::with_policy`], with the Tier 2 prompt-injection classifier.
+    /// Without one, `prompt_injection` uses the Tier 1 patterns only.
+    pub fn with_classifier(
+        policy: Policy,
+        classifier: Option<Arc<Classifier>>,
+    ) -> anyhow::Result<Self> {
+        if classifier.is_none() {
+            if let Some(route) = policy.routes.iter().find(|r| r.threshold.is_some()) {
+                anyhow::bail!(
+                    "route {:?} sets a prompt_injection threshold, but no injection model is loaded (--injection-model)",
+                    route.name
+                );
+            }
+        }
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
         http.enforce_http(false);
@@ -88,7 +108,11 @@ impl Proxy {
             .build(https);
 
         Ok(Self {
-            inner: Arc::new(Inner { policy, client }),
+            inner: Arc::new(Inner {
+                policy,
+                classifier,
+                client,
+            }),
         })
     }
 
@@ -150,54 +174,129 @@ impl Proxy {
             }
         };
 
+        let classifier = route.classifier().zip(self.inner.classifier.clone());
         let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
             Err(inspect::Unscannable)
         } else {
-            inspect::inspect(&route.detector, &route.input, &body)
+            inspect::inspect(&route.detector, &route.input, &body, classifier.is_some())
         };
-        let outcome = match outcome {
+        let mut outcome = match outcome {
             Ok(outcome) => outcome,
             Err(inspect::Unscannable) => {
                 tracing::warn!(route = %route.name, bytes = body.len(), compressed, fail_mode = ?route.fail_mode, "request body could not be inspected");
-                if route.fail_mode == FailMode::Closed && !route.shadow {
-                    return Ok(json_error(
-                        StatusCode::FORBIDDEN,
-                        "promptwall_uninspectable",
-                        "Request blocked by Promptwall: the body could not be inspected",
-                        &[],
-                    ));
-                }
-                return Ok(self.forward(with_body(parts, body), None).await);
+                return Ok(self.uninspected(route, parts, body).await);
             }
         };
 
-        let Some(action) = outcome.action else {
-            return Ok(self.forward(with_body(parts, body), None).await);
+        // Tier 2 runs only when Tier 1 has not already blocked the request.
+        let scoring = match classifier {
+            Some(((threshold, action), model))
+                if outcome.action != Some(Action::Block) && !outcome.untrusted_text.is_empty() =>
+            {
+                let text = std::mem::take(&mut outcome.untrusted_text);
+                let started = Instant::now();
+                let task = tokio::task::spawn_blocking(move || {
+                    model.score(&text).map(|score| (score, started.elapsed()))
+                });
+                Some((threshold, action, task))
+            }
+            _ => None,
         };
-        let kinds: Vec<String> = outcome.findings.keys().cloned().collect();
-        tracing::info!(
-            route = %route.name,
-            action = action.as_str(),
-            shadow = route.shadow,
-            findings = ?outcome.findings.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>(),
-            "sensitive data in request"
-        );
+        let Some((threshold, model_action, task)) = scoring else {
+            return Ok(self.decide(route, parts, body, outcome).await);
+        };
+
+        if !route.classifier_parallel {
+            return Ok(match classifier_verdict(route, task, threshold).await {
+                Some(hit) => {
+                    if hit {
+                        add_classifier_finding(&mut outcome, model_action);
+                    }
+                    self.decide(route, parts, body, outcome).await
+                }
+                None => self.uninspected(route, parts, body).await,
+            });
+        }
+
+        // Forward what Tier 1 allows while the classifier runs, and hold the
+        // response until it has decided. Its latency then hides behind the
+        // provider's time to first token instead of adding to it.
+        let tier1 = if route.shadow { None } else { outcome.action };
+        let body_out = match tier1 {
+            Some(Action::Redact) => outcome.redacted_body.take().unwrap_or(body),
+            _ => body,
+        };
+        let proxy = self.clone();
+        let upstream =
+            tokio::spawn(async move { proxy.forward(with_body(parts, body_out), tier1).await });
+        let hit = match classifier_verdict(route, task, threshold).await {
+            Some(hit) => hit,
+            None if route.fail_mode == FailMode::Closed && !route.shadow => {
+                upstream.abort();
+                return Ok(uninspectable());
+            }
+            None => false,
+        };
+        if hit {
+            add_classifier_finding(&mut outcome, model_action);
+        }
+        if let Some(action) = outcome.action {
+            log_findings(route, action, &outcome);
+        }
+        if hit && !route.shadow && model_action == Action::Block {
+            upstream.abort();
+            return Ok(policy_violation(&outcome));
+        }
+        let mut resp = match upstream.await {
+            Ok(resp) => resp,
+            Err(_) => text(StatusCode::BAD_GATEWAY, "upstream unavailable\n"),
+        };
+        if hit && !route.shadow && !resp.headers().contains_key(ACTION_HEADER) {
+            resp.headers_mut().insert(
+                ACTION_HEADER,
+                HeaderValue::from_static(model_action.as_str()),
+            );
+        }
+        Ok(resp)
+    }
+
+    /// Applies the inspection outcome: forwards, redacts or blocks.
+    async fn decide(
+        &self,
+        route: &policy::Route,
+        parts: http::request::Parts,
+        body: Bytes,
+        outcome: inspect::Outcome,
+    ) -> Response<ProxyBody> {
+        let Some(action) = outcome.action else {
+            return self.forward(with_body(parts, body), None).await;
+        };
+        log_findings(route, action, &outcome);
         if route.shadow {
-            return Ok(self.forward(with_body(parts, body), None).await);
+            return self.forward(with_body(parts, body), None).await;
         }
         match action {
-            Action::Block => Ok(json_error(
-                StatusCode::FORBIDDEN,
-                "promptwall_policy_violation",
-                &format!("Request blocked by Promptwall policy: {}", kinds.join(", ")),
-                &kinds,
-            )),
+            Action::Block => policy_violation(&outcome),
             Action::Redact => {
                 let body = outcome.redacted_body.unwrap_or(body);
-                Ok(self.forward(with_body(parts, body), Some(action)).await)
+                self.forward(with_body(parts, body), Some(action)).await
             }
-            Action::Flag => Ok(self.forward(with_body(parts, body), Some(action)).await),
+            Action::Flag => self.forward(with_body(parts, body), Some(action)).await,
         }
+    }
+
+    /// A request whose body could not be fully inspected: blocked or forwarded
+    /// unchanged, depending on the route's fail mode.
+    async fn uninspected(
+        &self,
+        route: &policy::Route,
+        parts: http::request::Parts,
+        body: Bytes,
+    ) -> Response<ProxyBody> {
+        if route.fail_mode == FailMode::Closed && !route.shadow {
+            return uninspectable();
+        }
+        self.forward(with_body(parts, body), None).await
     }
 
     async fn forward(
@@ -257,6 +356,66 @@ impl Proxy {
             });
         }
     }
+}
+
+/// Waits for the classifier. `None` means it failed and the route's fail mode
+/// decides.
+async fn classifier_verdict(
+    route: &policy::Route,
+    task: tokio::task::JoinHandle<anyhow::Result<(f32, Duration)>>,
+    threshold: f32,
+) -> Option<bool> {
+    match task.await {
+        Ok(Ok((score, elapsed))) => {
+            tracing::debug!(route = %route.name, score, elapsed_us = elapsed.as_micros() as u64, "injection classifier");
+            Some(score >= threshold)
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(route = %route.name, error = %format!("{err:#}"), "injection classifier failed");
+            None
+        }
+        Err(err) => {
+            tracing::warn!(route = %route.name, error = %err, "injection classifier panicked");
+            None
+        }
+    }
+}
+
+fn add_classifier_finding(outcome: &mut inspect::Outcome, action: Action) {
+    *outcome
+        .findings
+        .entry(Kind::InjectionClassifier.id())
+        .or_default() += 1;
+    outcome.action = outcome.action.max(Some(action));
+}
+
+fn log_findings(route: &policy::Route, action: Action, outcome: &inspect::Outcome) {
+    tracing::info!(
+        route = %route.name,
+        action = action.as_str(),
+        shadow = route.shadow,
+        findings = ?outcome.findings.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>(),
+        "sensitive data in request"
+    );
+}
+
+fn policy_violation(outcome: &inspect::Outcome) -> Response<ProxyBody> {
+    let kinds: Vec<String> = outcome.findings.keys().cloned().collect();
+    json_error(
+        StatusCode::FORBIDDEN,
+        "promptwall_policy_violation",
+        &format!("Request blocked by Promptwall policy: {}", kinds.join(", ")),
+        &kinds,
+    )
+}
+
+fn uninspectable() -> Response<ProxyBody> {
+    json_error(
+        StatusCode::FORBIDDEN,
+        "promptwall_uninspectable",
+        "Request blocked by Promptwall: the body could not be inspected",
+        &[],
+    )
 }
 
 /// Binds `addr` and returns the listener and its actual address (useful with port 0).

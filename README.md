@@ -28,7 +28,7 @@ To inspect requests, start it with a policy instead:
 cargo run --release -p promptwall -- --policy examples/policy.yaml
 ```
 
-With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
+With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, prompt-injection phrasing ("ignore all previous instructions", hidden Unicode, forged chat tokens) is blocked, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
 
 To measure the latency the proxy adds:
 
@@ -43,7 +43,8 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | Path | What it is |
 | --- | --- |
 | `crates/proxy` | The `promptwall` data plane (library and binary): routing, policy, inspection |
-| `crates/detect` | Tier 1 detectors for PII and secrets; no I/O, so it can also build for WebAssembly |
+| `crates/detect` | Tier 1 detectors for PII, secrets and prompt injection; no I/O, so it can also build for WebAssembly |
+| `crates/classify` | Tier 2 classifiers on CPU with ONNX Runtime (prompt injection) |
 | `crates/mock-upstream` | Mock OpenAI-compatible upstream used by tests and benchmarks |
 | `crates/bench` | `pw-bench`, the latency benchmark |
 
@@ -55,6 +56,7 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | [Threat model](docs/specs/threat-model.md) | What the MVP protects against and what it does not |
 | [Policy format](docs/specs/policy-format.md) | Draft of the YAML policy language |
 | [Benchmark](docs/specs/benchmark.md) | How latency and detection accuracy are measured |
+| [Models](docs/models.md) | Tier 2 classifiers: model format, latency and accuracy of open models |
 
 ## Contributing
 

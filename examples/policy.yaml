@@ -1,5 +1,7 @@
 # Example Promptwall policy. Run with:
 #   promptwall --policy examples/policy.yaml
+# and, to add the Tier 2 injection classifier (see docs/models.md):
+#   promptwall --policy examples/policy.yaml --injection-model models/injection
 # Format: docs/specs/policy-format.md
 version: 1
 
@@ -19,6 +21,9 @@ routes:
       path: /v1/messages
     upstream: anthropic
     input:
+      # Tier 1 patterns always; the classifier too when a model is loaded.
+      - detector: prompt_injection
+        action: block
       - detector: secrets
         action: block
       - detector: pii

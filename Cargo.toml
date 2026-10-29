@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/detect", "crates/proxy", "crates/mock-upstream", "crates/bench"]
+members = ["crates/detect", "crates/classify", "crates/proxy", "crates/mock-upstream", "crates/bench"]
 
 [workspace.package]
 version = "0.0.1"

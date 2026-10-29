@@ -1,0 +1,18 @@
+[package]
+name = "promptwall-classify"
+description = "Promptwall Tier 2 detectors: small text classifiers on CPU with ONNX Runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ort = "=2.0.0-rc.10"
+serde.workspace = true
+serde_json.workspace = true
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]
+promptwall-detect = { path = "../detect" }
