@@ -61,6 +61,7 @@ impl OutputCheck {
                 f.kind.category() != Category::Exfiltration
                     || !allowed(&text[f.start..f.end], &rules.allow_domains)
             })
+            .filter(|f| !crate::inspect::excepted(&rules.except, f.kind, &text[f.start..f.end]))
             .collect();
         if let Some(index) = &self.system {
             if rules.actions.contains_key(&Kind::SystemPromptLeak) {
@@ -131,6 +132,47 @@ impl OutputCheck {
             "sensitive data in response"
         );
     }
+}
+
+/// Checks one answer text the way [`whole`] checks an answer, for
+/// [`crate::Proxy::check`]. Blocking: the models run inline.
+pub(crate) fn check_text(check: &OutputCheck, text: &str) -> anyhow::Result<crate::Verdict> {
+    let mut verdict = crate::Verdict {
+        text: text.to_owned(),
+        ..Default::default()
+    };
+    let found = check.scan(text);
+    let mut spans = Vec::new();
+    for (f, action) in &found {
+        *verdict.findings.entry(check.label(f.kind)).or_insert(0) += 1;
+        verdict.action = verdict.action.max(Some(*action));
+        if *action == Action::Redact {
+            spans.push((f.start, f.end, check.marker(f.kind)));
+        }
+    }
+    if !spans.is_empty() {
+        verdict.text = rewrite(text, 0, &spans);
+    }
+    if let Some((rule, model)) = &check.safety {
+        let labels = model.check(text, None, rule)?;
+        if !labels.is_empty() {
+            verdict.action = verdict.action.max(Some(rule.action));
+        }
+        for label in labels {
+            *verdict.findings.entry(label).or_insert(0) += 1;
+        }
+    }
+    if let Some((rule, model)) = &check.pii {
+        let tagged = model.tag_text(rule, &mut verdict.text)?;
+        for (label, n) in tagged.findings {
+            *verdict.findings.entry(label).or_insert(0) += n;
+        }
+        verdict.action = verdict.action.max(tagged.action);
+    }
+    if verdict.action != Some(Action::Redact) {
+        verdict.text = text.to_owned();
+    }
+    Ok(verdict)
 }
 
 /// Whether the host of `url` is one of `domains` or a subdomain of one.

@@ -113,18 +113,24 @@ impl PiiModel {
         }
         Ok(found
             .into_iter()
-            .map(|entities| {
+            .zip(texts)
+            .map(|(entities, text)| {
                 entities
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|e| {
                         let entity = e.label.to_ascii_lowercase();
-                        let (action, threshold) = *rule.entities.get(&entity)?;
-                        (e.score >= threshold).then_some(Span {
+                        let rule = rule.entities.get(&entity)?;
+                        let value = text.get(e.start..e.end)?;
+                        let excepted = rule
+                            .except
+                            .iter()
+                            .any(|p| crate::tools::glob(p, value.trim()));
+                        (e.score >= rule.threshold && !excepted).then_some(Span {
                             start: e.start,
                             end: e.end,
                             entity,
-                            action,
+                            action: rule.action,
                         })
                     })
                     .collect()
