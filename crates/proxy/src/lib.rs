@@ -8,6 +8,7 @@
 pub mod inspect;
 pub mod output;
 pub mod policy;
+pub mod tools;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -165,6 +166,7 @@ impl Proxy {
                 shadow: route.shadow,
                 fail_closed: route.fail_mode == FailMode::Closed,
                 system: None,
+                tools: route.tools.clone(),
             }));
         }
 
@@ -208,6 +210,9 @@ impl Proxy {
         };
         let mut outcome = match outcome {
             Ok(mut outcome) => {
+                if let Some(rules) = &route.tools {
+                    check_offered_tools(rules, &body, &mut outcome);
+                }
                 if let (Some(words), Some(rules)) = (leak_words, &route.output) {
                     let system = std::mem::take(&mut outcome.trusted_text);
                     parts.extensions.insert(Arc::new(output::OutputCheck {
@@ -216,6 +221,7 @@ impl Proxy {
                         shadow: route.shadow,
                         fail_closed: route.fail_mode == FailMode::Closed,
                         system: Some(SystemPromptIndex::new(&system, words)),
+                        tools: route.tools.clone(),
                     }));
                 }
                 outcome
@@ -439,6 +445,24 @@ fn log_findings(route: &policy::Route, action: Action, outcome: &inspect::Outcom
         findings = ?outcome.findings.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>(),
         "sensitive data in request"
     );
+}
+
+/// Records the tools a request offers that the route does not allow.
+fn check_offered_tools(rules: &tools::ToolRules, body: &[u8], outcome: &mut inspect::Outcome) {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    let denied = tools::offered(&json)
+        .iter()
+        .filter(|name| !rules.allows(name))
+        .count();
+    if denied > 0 {
+        *outcome
+            .findings
+            .entry(tools::NOT_ALLOWED.to_owned())
+            .or_default() += denied;
+        outcome.action = outcome.action.max(Some(rules.action));
+    }
 }
 
 fn policy_violation(outcome: &inspect::Outcome) -> Response<ProxyBody> {

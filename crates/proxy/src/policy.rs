@@ -15,6 +15,8 @@ use http::Uri;
 use promptwall_detect::{Category, Detector, Kind};
 use serde::Deserialize;
 
+use crate::tools::{ArgumentRule, ToolRules};
+
 /// What happens when a detector finds something. Ordered by severity.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +84,8 @@ pub struct Route {
     pub classifier_parallel: bool,
     /// Checks on the provider's response, if the route has any.
     pub output: Option<Arc<OutputRules>>,
+    /// Which tools the model may be offered and call, if limited.
+    pub tools: Option<Arc<ToolRules>>,
 }
 
 /// The `output` detectors of a route.
@@ -121,10 +125,13 @@ impl Route {
         !self.input.is_empty()
     }
 
-    /// Whether the request body must be read: to inspect it, or to learn the
-    /// system prompt that the leak check compares the answer with.
+    /// Whether the request body must be read: to inspect it, to check the
+    /// tools it offers, or to learn the system prompt that the leak check
+    /// compares the answer with.
     pub fn reads_request(&self) -> bool {
-        self.inspects_input() || self.output.as_ref().is_some_and(|o| o.leak_words.is_some())
+        self.inspects_input()
+            || self.tools.is_some()
+            || self.output.as_ref().is_some_and(|o| o.leak_words.is_some())
     }
 
     /// Threshold and action for the injection classifier, if this route uses it.
@@ -179,6 +186,7 @@ impl Policy {
                 threshold: None,
                 classifier_parallel: true,
                 output: None,
+                tools: None,
             }],
         })
     }
@@ -232,12 +240,28 @@ impl Policy {
                 ..
             } = compile_detectors(&spec.input, Side::Input)
                 .with_context(|| format!("route {name:?} input"))?;
+            let tools = spec
+                .tools
+                .map(compile_tools)
+                .transpose()
+                .with_context(|| format!("route {name:?} tools"))?
+                .map(Arc::new);
             let output = if spec.output.is_empty() {
                 ensure!(
                     spec.stream_holdback.is_none(),
                     "route {name:?}: stream_holdback needs output detectors"
                 );
-                None
+                // Tool calls in the answer are checked on the same path as
+                // output detectors, with none of those configured.
+                tools.as_ref().map(|_| {
+                    Arc::new(OutputRules {
+                        actions: HashMap::new(),
+                        detector: Detector::new(),
+                        allow_domains: Vec::new(),
+                        leak_words: None,
+                        holdback: DEFAULT_HOLDBACK,
+                    })
+                })
             } else {
                 let out = compile_detectors(&spec.output, Side::Output)
                     .with_context(|| format!("route {name:?} output"))?;
@@ -263,6 +287,7 @@ impl Policy {
                 threshold,
                 classifier_parallel: parallel.unwrap_or(true),
                 output,
+                tools,
                 name,
             });
         }
@@ -451,6 +476,75 @@ struct RouteFile {
     #[serde(default)]
     output: Vec<DetectorFile>,
     stream_holdback: Option<usize>,
+    tools: Option<ToolsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsFile {
+    allow: Option<Vec<String>>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    arguments: Vec<ArgumentFile>,
+    action: Action,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArgumentFile {
+    tool: String,
+    field: String,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    allow_domains: Vec<String>,
+}
+
+fn compile_tools(spec: ToolsFile) -> anyhow::Result<ToolRules> {
+    ensure!(
+        spec.action != Action::Redact,
+        "action must be block or flag: a tool call cannot be redacted"
+    );
+    ensure!(
+        spec.allow.is_some() || !spec.deny.is_empty() || !spec.arguments.is_empty(),
+        "set at least one of allow, deny and arguments"
+    );
+    let arguments = spec
+        .arguments
+        .into_iter()
+        .map(|a| {
+            ensure!(
+                !a.field.trim().is_empty(),
+                "argument rule for {:?} has an empty field",
+                a.tool
+            );
+            ensure!(
+                !(a.allow.is_empty() && a.deny.is_empty() && a.allow_domains.is_empty()),
+                "argument rule for {:?} needs allow, deny or allow_domains",
+                a.tool
+            );
+            Ok(ArgumentRule {
+                field: a.field.split('.').map(str::to_owned).collect(),
+                tool: a.tool,
+                allow: a.allow,
+                deny: a.deny,
+                allow_domains: a
+                    .allow_domains
+                    .iter()
+                    .map(|d| d.trim().trim_start_matches("*.").to_ascii_lowercase())
+                    .collect(),
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(ToolRules {
+        allow: spec.allow,
+        deny: spec.deny,
+        arguments,
+        action: spec.action,
+    })
 }
 
 #[derive(Default, Deserialize)]
@@ -579,7 +673,7 @@ routes:
         .contains("unknown entity \"ssn\""));
         // A field from the spec that this version does not support yet.
         assert!(err(&format!(
-            "{base}routes: [{{ name: r, upstream: a, tools: [] }}]"
+            "{base}routes: [{{ name: r, upstream: a, limits: {{}} }}]"
         ))
         .contains("unknown field"));
         assert!(err("version: 2\nupstreams: {}\nroutes: []").contains("unsupported policy version"));

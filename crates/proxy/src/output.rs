@@ -20,6 +20,7 @@ use promptwall_detect::{Category, Finding, Kind, SystemPromptIndex};
 use serde_json::Value;
 
 use crate::policy::{Action, OutputRules};
+use crate::tools::{StreamCalls, ToolCall, ToolRules};
 use crate::{full, json_error, ProxyBody, ACTION_HEADER, MAX_BODY_BYTES, MAX_SCAN_BYTES};
 
 /// What one request needs for checking its response.
@@ -31,12 +32,17 @@ pub struct OutputCheck {
     pub fail_closed: bool,
     /// The request's system prompt, when the leak check is on.
     pub system: Option<SystemPromptIndex>,
+    /// Limits on the tool calls in the answer.
+    pub tools: Option<Arc<ToolRules>>,
 }
 
 impl OutputCheck {
     /// Findings in `text` that the route acts on, sorted and without overlaps.
     fn scan(&self, text: &str) -> Vec<(Finding, Action)> {
         let rules = &self.rules;
+        if rules.actions.is_empty() {
+            return Vec::new(); // only tool calls are checked
+        }
         let mut found: Vec<Finding> = rules
             .detector
             .scan(text)
@@ -64,6 +70,25 @@ impl OutputCheck {
             .into_iter()
             .map(|f| (f, rules.actions[&f.kind]))
             .collect()
+    }
+
+    /// Records the tool calls that break the route's tool rules; returns the
+    /// action they call for.
+    fn check_tools(
+        &self,
+        calls: &[ToolCall],
+        findings: &mut BTreeMap<String, usize>,
+    ) -> Option<Action> {
+        let rules = self.tools.as_ref()?;
+        let mut hit = false;
+        for call in calls {
+            for label in rules.check(call) {
+                tracing::debug!(route = %self.route, tool = %call.name, label, "tool call rejected");
+                *findings.entry(label.to_owned()).or_insert(0) += 1;
+                hit = true;
+            }
+        }
+        hit.then_some(rules.action)
     }
 
     fn label(&self, kind: Kind) -> String {
@@ -189,8 +214,12 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
             changed = true;
         }
     };
+    let mut tool_action = None;
     let new_body = if let Ok(mut json) = serde_json::from_slice::<Value>(&bytes) {
         crate::inspect::visit_strings(&mut json, None, false, &mut |s, _, _| apply(s));
+        let mut tool_findings = BTreeMap::new();
+        tool_action = check.check_tools(&crate::tools::calls(&json), &mut tool_findings);
+        findings.extend(tool_findings);
         changed.then(|| Bytes::from(serde_json::to_vec(&json).unwrap_or_default()))
     } else if let Ok(text) = std::str::from_utf8(&bytes) {
         let mut text = text.to_owned();
@@ -200,7 +229,7 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
         return unscannable(&check, parts, full(bytes));
     };
 
-    let Some(action) = action else {
+    let Some(action) = action.max(tool_action) else {
         return Response::from_parts(parts, full(bytes));
     };
     check.log(action, &findings, false);
@@ -270,6 +299,9 @@ struct Event {
     /// End of this event's text in the whole answer; it can be sent once the
     /// release point has passed it.
     text_end: usize,
+    /// Part of or after a tool call, held until the calls are checked at the
+    /// end of the stream.
+    held: bool,
 }
 
 enum EventBody {
@@ -304,6 +336,8 @@ struct Sse {
     findings: BTreeMap<String, usize>,
     action: Option<Action>,
     finished: bool,
+    /// Tool calls seen so far, when the route limits them.
+    calls: StreamCalls,
 }
 
 /// JSON keys whose string values are answer text in streamed events (OpenAI
@@ -325,6 +359,7 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
         findings: BTreeMap::new(),
         action: None,
         finished: false,
+        calls: StreamCalls::default(),
     };
     let events = futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -371,9 +406,24 @@ impl Sse {
             self.push(raw);
         }
         self.scan(at_end);
+        let text_blocked = self.action == Some(Action::Block);
+        if at_end && !self.calls.is_empty() {
+            let action = self
+                .check
+                .check_tools(&self.calls.finish(), &mut self.findings);
+            self.action = self.action.max(action);
+        }
         if self.action == Some(Action::Block) && !self.check.shadow {
-            // Drop the held-back text, end the stream with an error event and
-            // stop reading from the provider, which closes that connection.
+            // End the stream with an error event and stop reading from the
+            // provider, which closes that connection. Held-back text goes too,
+            // unless only a tool call was rejected: then the text before it
+            // is fine and is sent first.
+            let mut out = BytesMut::new();
+            if !text_blocked {
+                while let Some(event) = self.pending.pop_front().filter(|e| !e.held) {
+                    self.write(event, &mut out);
+                }
+            }
             self.pending.clear();
             self.upstream = None;
             self.finished = true;
@@ -384,7 +434,8 @@ impl Sse {
                 "message": format!("Response blocked by Promptwall policy: {}", kinds.join(", ")),
                 "findings": kinds,
             }});
-            return Bytes::from(format!("event: error\ndata: {error}\n\n"));
+            out.extend_from_slice(format!("event: error\ndata: {error}\n\n").as_bytes());
+            return out.freeze();
         }
         let release_to = if at_end {
             self.text.len()
@@ -398,7 +449,7 @@ impl Sse {
         while self
             .pending
             .front()
-            .is_some_and(|e| e.text_end <= release_to)
+            .is_some_and(|e| e.text_end <= release_to && (at_end || !e.held))
         {
             let event = self.pending.pop_front().expect("checked");
             self.released = self.released.max(event.text_end);
@@ -412,11 +463,13 @@ impl Sse {
     }
 
     fn push(&mut self, raw: Bytes) {
+        let held = !self.calls.is_empty();
         let Ok(block) = std::str::from_utf8(&raw) else {
             return self.pending.push_back(Event {
                 head: String::new(),
                 body: EventBody::Raw(raw),
                 text_end: self.text.len(),
+                held,
             });
         };
         let mut head = String::new();
@@ -438,8 +491,11 @@ impl Sse {
                 head: String::new(),
                 body: EventBody::Raw(raw),
                 text_end: self.text.len(),
+                held,
             });
         };
+        // From the first tool call on, events wait for the end of the stream.
+        let held = (self.check.tools.is_some() && self.calls.feed(&json)) || held;
         // Final events (OpenAI Responses `*.done`, `response.completed`) repeat
         // the whole answer: check them on their own instead of adding them
         // to the running text.
@@ -453,6 +509,7 @@ impl Sse {
                 head: String::new(),
                 body: EventBody::Raw(Bytes::from(text)),
                 text_end: self.text.len(),
+                held,
             });
         }
         let mut fields = Vec::new();
@@ -469,6 +526,7 @@ impl Sse {
             head,
             body,
             text_end: self.text.len(),
+            held,
         });
     }
 
