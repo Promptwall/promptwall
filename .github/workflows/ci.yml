@@ -31,4 +31,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Shared CI runners are noisy, so the gate here is looser than the
       # 2 ms pass-through target in docs/specs/benchmark.md.
-      - run: scripts/bench.sh --rate 200 --duration 10 --max-p95-added-ms 5
+      - name: Pass-through
+        run: scripts/bench.sh --rate 200 --duration 10 --max-p95-added-ms 5
+      - name: With PII and secret detection
+        run: scripts/bench.sh --rate 200 --duration 10 --max-p95-added-ms 5
+        env:
+          BENCH_POLICY: scripts/bench-policy.yaml

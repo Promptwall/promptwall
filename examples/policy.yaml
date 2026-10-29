@@ -1,0 +1,38 @@
+# Example Promptwall policy. Run with:
+#   promptwall --policy examples/policy.yaml
+# Format: docs/specs/policy-format.md
+version: 1
+
+defaults:
+  fail_mode: open   # forward requests that cannot be inspected (compressed, over 4 MiB)
+  shadow: false     # set to true to only log what would happen
+
+upstreams:
+  openai:
+    url: https://api.openai.com
+  anthropic:
+    url: https://api.anthropic.com
+
+routes:
+  - name: anthropic
+    match:
+      path: /v1/messages
+    upstream: anthropic
+    input:
+      - detector: secrets
+        action: block
+      - detector: pii
+        action: redact
+
+  - name: openai
+    upstream: openai
+    fail_mode: closed
+    input:
+      - detector: secrets
+        action: block
+      - detector: pii
+        entities: [email, iban, credit_card]
+        action: redact
+      - detector: pii
+        entities: [phone]
+        action: flag

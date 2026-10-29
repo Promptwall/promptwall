@@ -1,0 +1,12 @@
+[package]
+name = "promptwall-detect"
+description = "Promptwall Tier 1 detectors: fast pattern-based PII and secret detection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# No async or I/O here: this crate must also compile to WebAssembly for the npm package.
+[dependencies]
+regex = "1"
