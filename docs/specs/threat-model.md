@@ -29,7 +29,7 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 | LLM05 Improper output handling | **Partly.** Markdown image and link exfiltration, dangerous URLs | Tier 1 |
 | LLM07 System prompt leakage | **In scope.** Detects the system prompt echoed in output | Tier 1 (similarity) |
 | LLM10 Unbounded consumption | **Basic.** Per-key request and token rate limits | Proxy |
-| LLM06 Excessive agency | Out of scope for MVP; tool-call firewall comes in Phase 4 | |
+| LLM06 Excessive agency | **Basic.** Allow and deny lists for the tools a request offers and the model calls, and limits on argument values (patterns, domains). Deeper checks of what a tool does with its arguments are out of scope | Proxy |
 | LLM03 Supply chain, LLM04 Data and model poisoning, LLM08 Vector and embedding weaknesses, LLM09 Misinformation | Out of scope; these are not addressed inline at the request level | |
 
 ## Known limits

@@ -63,3 +63,11 @@ routes:
       # The answer repeats ten or more words of the system prompt.
       - detector: system_prompt_leak
         action: block
+    # Tools the model may use, and limits on their arguments.
+    tools:
+      allow: [get_weather, search_docs, send_email]
+      action: block
+      arguments:
+        - tool: send_email
+          field: to
+          allow: ['*@example.com']

@@ -13,7 +13,8 @@
 | `routes[].input` with `detector: custom`, `name`, `pattern` or `keywords`, `action` | Yes |
 | `routes[].input` with `detector: prompt_injection`, `entities`, `threshold`, `parallel`, `action` | Yes |
 | `routes[].output` with `detector: pii`, `secrets`, `custom`, `exfiltration` (`allow_domains`), `system_prompt_leak` (`min_words`), `action`; `routes[].stream_holdback` | Yes |
-| `mode: indirect`, `untrusted_content`, `tools`, `rules`, `limits`, `tests` | Not yet |
+| `routes[].tools` with `allow`, `deny`, `arguments` (`tool`, `field`, `allow`, `deny`, `allow_domains`), `action: block \| flag` | Yes |
+| `mode: indirect`, `untrusted_content`, `rules`, `limits`, `tests` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
 
@@ -101,6 +102,36 @@ A JSON answer is read whole and every string in it is checked. `block` replaces 
 Streamed answers (`text/event-stream`, as with `"stream": true`) are checked as they pass. The text of each event (`delta.content`, `delta.text`, `delta`) is joined into the running answer, and the last `stream_holdback` characters (default 128) are held back until the next events arrive, so a value split across events is seen whole before any part of it reaches the app. A redaction rewrites the events that carry the value; a block drops the held-back events, sends an `event: error` with a `promptwall_policy_violation` body and closes the provider connection. Text sent before a finding cannot be called back; a larger holdback catches longer values at the cost of a slightly later first token. Final events that repeat the whole answer (`response.completed`, `*.done`) are checked on their own.
 
 The proxy asks the provider for uncompressed answers on routes with `output` detectors. Answers it still cannot read (compressed, binary JSON, over 4 MiB) follow `fail_mode`.
+
+## Tool calls
+
+`tools` limits which tools the model may use and what it may pass to them.
+
+```yaml
+tools:
+  allow: [get_weather, search_docs, send_email, fetch_*]   # any other tool is rejected
+  deny: [fetch_internal]                                   # rejected even if allowed above
+  action: block                                            # block or flag
+  arguments:
+    - tool: send_email
+      field: to                    # dots go deeper: request.url
+      allow: ['*@example.com']     # every value must match one pattern
+    - tool: fetch_*
+      field: url
+      allow_domains: [example.com] # URLs, emails or hosts on these domains and subdomains
+    - tool: run_sql
+      field: query
+      deny: ['*drop table*', '*delete from*']
+```
+
+Names and values are matched case-insensitively, and `*` stands for any text. Without `allow`, every tool not in `deny` is allowed. An argument rule applies to every tool its `tool` pattern matches. When the field holds a list, each element must pass, and a missing field passes.
+
+The checks run in two places:
+
+- **Requests.** A request that offers a tool outside the lists is rejected (`tool.not_allowed`) before it reaches the provider. This also covers tools the provider runs itself, which are named by their type: `web_search_preview`, `code_interpreter` and `file_search` (OpenAI), `web_search` (Anthropic), `googleSearch` and `codeExecution` (Gemini).
+- **Answers.** Tool calls in the answer (OpenAI Chat Completions and Responses, Anthropic, Gemini) are checked before the app sees them. A call to a tool outside the lists gives `tool.not_allowed`, a value that breaks an argument rule gives `tool.argument`, and arguments that are not valid JSON give `tool.malformed_arguments`. A blocked answer becomes a `403` error. In a streamed answer, the events of tool calls are held until the stream ends and the arguments are complete. The text before them still streams. A block then ends the stream with an `event: error`, and no part of the call is sent.
+
+Argument values also pass through the route's `output` detectors, so a secret or personal data in a tool argument is caught there.
 
 `fail_mode` applies to request bodies that cannot be inspected: compressed bodies, bodies over 4 MiB, and binary bodies. Bodies over 32 MiB are always rejected with `413`.
 
