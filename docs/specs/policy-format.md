@@ -18,7 +18,8 @@
 | `detector: pii` with model entities (`person`, `street_address`, ...) and `threshold`, on input and output | Yes, with `--pii-model` |
 | `except` on `pii`, `secrets`, `custom`, `prompt_injection` and `exfiltration` entries; `action: allow` | Yes |
 | `tests` (`route`, `input` or `output`, `expect`), `promptwall validate`, `test` and `scan` | Yes |
-| `mode: indirect`, `untrusted_content`, `rules`, `limits`, `action: rewrite` | Not yet |
+| `routes[].limits` with `key`, `requests_per_minute`, `requests_per_day`, `tokens_per_minute`, `tokens_per_day` | Yes |
+| `mode: indirect`, `untrusted_content`, `rules`, `action: rewrite` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
 
@@ -244,7 +245,7 @@ routes:
         action: block
     limits:
       requests_per_minute: 600
-      tokens_per_day: 2_000_000
+      tokens_per_day: 2000000
 
   - name: internal-rag
     match:
@@ -280,6 +281,22 @@ routes:
 
 - Every built-in detector and rule has a stable ID (for example `pii.iban`, `injection.ignore_previous`).
 - Open source rules are defined only in this repository. Commercial rule packs are additive and may not redefine an open rule ID; CI enforces this.
+
+## Limits
+
+```yaml
+limits:
+  key: header:x-user-id      # route (default), api_key or header:<name>
+  requests_per_minute: 60
+  requests_per_day: 5000
+  tokens_per_day: 2000000
+```
+
+A request over a limit gets `429` with a `promptwall_rate_limited` error and `Retry-After` in seconds; in shadow mode it is only logged. `key` decides who shares a count: the whole route, each API key (`Authorization`, `x-api-key` or `x-goog-api-key`; only a hash is kept), or each value of a header the app sets, such as a user ID. Requests without that header share one count.
+
+Windows are the current UTC minute and day. Requests are counted as they arrive. Tokens are counted when the answer has been sent, from the usage the provider reports in it (`prompt_tokens` and `completion_tokens`, `input_tokens` and `output_tokens`, Gemini's `usageMetadata`), so a request is refused only once earlier ones have used up the budget. Answers without usage, such as OpenAI streams without `stream_options.include_usage`, are estimated at a token per 4 bytes of request and answer, which counts more than the provider does.
+
+Counters live in the memory of each proxy instance and start over when it restarts. Behind a load balancer with several instances, divide the limits by their number; shared counters are planned for the enterprise edition.
 
 ## Testing policies
 

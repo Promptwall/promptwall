@@ -80,6 +80,11 @@ routes:
       # The answer repeats ten or more words of the system prompt.
       - detector: system_prompt_leak
         action: block
+    # At most 60 requests a minute and 1M tokens a day per API key.
+    limits:
+      key: api_key
+      requests_per_minute: 60
+      tokens_per_day: 1000000
     # Tools the model may use, and limits on their arguments.
     tools:
       allow: [get_weather, search_docs, send_email]
