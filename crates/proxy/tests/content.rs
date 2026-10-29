@@ -4,6 +4,9 @@
 //! "other"), and the NLI model says a text is about a topic when either of
 //! them contains "attack".
 
+// These tests load ONNX models, so they need the `models` feature.
+#![cfg(feature = "models")]
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;

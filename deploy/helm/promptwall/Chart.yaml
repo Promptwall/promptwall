@@ -1,0 +1,12 @@
+apiVersion: v2
+name: promptwall
+description: Promptwall, the open source AI firewall, as a proxy in front of your LLM provider
+type: application
+# The chart version follows the Promptwall release.
+version: 0.0.1
+appVersion: "v0.0.1"
+home: https://github.com/Promptwall/promptwall
+sources:
+  - https://github.com/Promptwall/promptwall
+license: Apache-2.0
+keywords: [llm, ai, firewall, security, prompt-injection, dlp]

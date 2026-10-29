@@ -9,10 +9,15 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-ort = "=2.0.0-rc.10"
+ort = { version = "=2.0.0-rc.10", optional = true }
 serde.workspace = true
 serde_json.workspace = true
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"], optional = true }
+
+[features]
+default = ["onnx"]
+# ONNX Runtime and the tokenizer, for the Tier 2 models.
+onnx = ["dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 promptwall-detect = { path = "../detect" }

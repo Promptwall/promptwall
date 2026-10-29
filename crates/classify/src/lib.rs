@@ -23,15 +23,29 @@
 //! Token-classification (NER) models, whose logits are shaped
 //! `[batch, tokens, labels]` with `B-`/`I-` labels such as `B-PERSON`, find
 //! entities in a text instead: see [`Classifier::entities`].
+//!
+//! Without the `onnx` feature (on by default), the crate builds without ONNX
+//! Runtime: [`Classifier::load`] then always fails, and nothing else changes,
+//! so a build for a platform without ONNX Runtime keeps every other check.
+
+// Without ONNX Runtime, the helpers below are only used by the tests.
+#![cfg_attr(not(feature = "onnx"), allow(dead_code))]
 
 use std::path::Path;
+#[cfg(feature = "onnx")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "onnx")]
 use std::sync::Mutex;
 
+#[cfg(feature = "onnx")]
 use anyhow::{bail, ensure, Context};
+#[cfg(feature = "onnx")]
 use ort::session::builder::GraphOptimizationLevel;
+#[cfg(feature = "onnx")]
 use ort::session::Session;
+#[cfg(feature = "onnx")]
 use ort::value::Tensor;
+#[cfg(feature = "onnx")]
 use tokenizers::Tokenizer;
 
 /// Longest window the classifier sees, in tokens.
@@ -92,6 +106,7 @@ impl Default for Options {
     }
 }
 
+#[cfg(feature = "onnx")]
 pub struct Classifier {
     sessions: Vec<Mutex<Session>>,
     next: AtomicUsize,
@@ -113,6 +128,7 @@ pub struct Classifier {
     max_tag_tokens: usize,
 }
 
+#[cfg(feature = "onnx")]
 impl std::fmt::Debug for Classifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Classifier")
@@ -122,6 +138,7 @@ impl std::fmt::Debug for Classifier {
     }
 }
 
+#[cfg(feature = "onnx")]
 impl Classifier {
     pub fn load(dir: &Path, options: &Options) -> anyhow::Result<Self> {
         let config: serde_json::Value = match std::fs::read(dir.join("config.json")) {
@@ -491,6 +508,49 @@ impl Classifier {
     }
 }
 
+/// A build without ONNX Runtime: no model can be loaded, so no value of this
+/// type ever exists and its methods are never called.
+#[cfg(not(feature = "onnx"))]
+#[derive(Debug)]
+pub struct Classifier {
+    never: std::convert::Infallible,
+}
+
+#[cfg(not(feature = "onnx"))]
+impl Classifier {
+    pub fn load(dir: &Path, _options: &Options) -> anyhow::Result<Self> {
+        anyhow::bail!(
+            "cannot load the model in {}: this build of Promptwall has no ONNX Runtime. \
+             Use a build with models (the default; see docs/install.md)",
+            dir.display()
+        )
+    }
+
+    pub fn labels(&self) -> &[String] {
+        match self.never {}
+    }
+
+    pub fn score(&self, _text: &str) -> anyhow::Result<f32> {
+        match self.never {}
+    }
+
+    pub fn scores(&self, _text: &str, _pair: Pair) -> anyhow::Result<Vec<f32>> {
+        match self.never {}
+    }
+
+    pub fn scores_each(&self, _text: &str, _pairs: &[Pair]) -> anyhow::Result<Vec<Vec<f32>>> {
+        match self.never {}
+    }
+
+    pub fn entity_types(&self) -> Vec<String> {
+        match self.never {}
+    }
+
+    pub fn entities(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<Entity>>> {
+        match self.never {}
+    }
+}
+
 /// Windows tagged per inference.
 const TAG_BATCH: usize = 16;
 
@@ -632,6 +692,7 @@ fn softmax(row: &[f32]) -> Vec<f32> {
 }
 
 /// The special tokens the tokenizer puts before and after a single text.
+#[cfg(feature = "onnx")]
 fn special_tokens(tokenizer: &Tokenizer) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let encode = |special| {
         tokenizer
@@ -649,6 +710,7 @@ fn special_tokens(tokenizer: &Tokenizer) -> anyhow::Result<(Vec<u32>, Vec<u32>)>
 
 /// The special tokens around two texts, learnt from a probe; `None` if the
 /// tokenizer has no template for pairs.
+#[cfg(feature = "onnx")]
 fn pair_template(tokenizer: &Tokenizer) -> Option<PairTemplate> {
     let plain = |t: &str| {
         tokenizer

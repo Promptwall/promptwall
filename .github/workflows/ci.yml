@@ -22,6 +22,34 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
 
+  light:
+    name: Build without models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The build without ONNX Runtime (for platforms it does not support) must
+      # keep compiling and pass every test that needs no model.
+      - run: cargo clippy -p promptwall -p promptwall-classify --no-default-features --all-targets -- -D warnings
+      - run: cargo test -p promptwall -p promptwall-classify --no-default-features
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/promptwall
+      - name: Render with every option on
+        run: |
+          helm template pw deploy/helm/promptwall \
+            --set metrics.enabled=true --set decisionLog.enabled=true \
+            --set policySigning.publicKey=dGVzdA== --set models.existingClaim=models \
+            --set models.injection=true --set models.pii=true > /dev/null
+
   latency:
     name: Latency gate
     runs-on: ubuntu-latest
