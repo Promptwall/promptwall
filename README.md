@@ -36,6 +36,8 @@ cargo run --release -p promptwall -- --policy examples/policy.yaml
 
 With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, prompt-injection phrasing ("ignore all previous instructions", also as base64, leetspeak or look-alike letters; hidden Unicode, forged chat tokens) is blocked, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
 
+Changes to the policy file apply within two seconds, without a restart (`--reload-interval`, 0 turns it off). A file with an error is logged and ignored; the previous policy stays in force. Rate-limit counters carry over for routes whose limits did not change.
+
 To check a policy without running the proxy:
 
 ```sh

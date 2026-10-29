@@ -17,6 +17,7 @@ Labels are route names, actions and finding labels such as `pii.email`. Prompt a
 | `promptwall_request_duration_seconds` | histogram | `route` | Time until the response headers were sent, including the provider |
 | `promptwall_uninspected_total` | counter | `route`, `direction` | Requests or responses that could not be inspected (compressed, too large, model failure) |
 | `promptwall_upstream_errors_total` | counter | | Requests whose provider could not be reached |
+| `promptwall_policy_reloads_total` | counter | `result` | Policy file reloads: `ok`, or `error` when the changed file was rejected and the previous policy stayed in force |
 | `promptwall_build_info` | gauge | `version` | Always 1 |
 
 Shadow-mode findings are counted too; `action` then says what was let through.

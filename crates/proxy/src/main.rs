@@ -69,6 +69,11 @@ struct Args {
     #[arg(long, env = "PROMPTWALL_METRICS_LISTEN")]
     metrics_listen: Option<SocketAddr>,
 
+    /// Seconds between checks of the policy file for changes, which are
+    /// applied without a restart. 0 turns reloading off.
+    #[arg(long, env = "PROMPTWALL_RELOAD_INTERVAL", default_value_t = 2)]
+    reload_interval: u64,
+
     /// Threads each classifier session may use for one inference (default 1).
     /// More threads make each check faster; more sessions let more checks run
     /// at the same time.
@@ -231,6 +236,13 @@ async fn main() -> anyhow::Result<()> {
         let (listener, addr) = promptwall::bind(addr).await?;
         tracing::info!(%addr, "metrics on /metrics");
         tokio::spawn(promptwall::metrics::serve(listener));
+    }
+    if let Some(path) = args.policy.filter(|_| args.reload_interval > 0) {
+        tokio::spawn(promptwall::reload::watch(
+            proxy.clone(),
+            path,
+            std::time::Duration::from_secs(args.reload_interval),
+        ));
     }
     let (listener, addr) = promptwall::bind(args.listen).await?;
     tracing::info!(%addr, "promptwall listening");

@@ -20,7 +20,7 @@ use crate::ProxyBody;
 const MAX_KEYS: usize = 100_000;
 
 /// The `limits` of a route.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Limits {
     pub key: LimitKey,
     pub requests_per_minute: Option<u64>,
