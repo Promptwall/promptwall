@@ -276,6 +276,24 @@ pub(crate) const RULES: &[Spec] = &[
         r"[\x{E0000}-\x{E007F}]{2,}|[\x{202D}\x{202E}]|[\x{200B}-\x{200D}\x{2060}\x{FEFF}]{3,}|[\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}]{4,}",
         accept,
     ),
+    // Indirect injection: text inside a document, web page, email or tool
+    // result that addresses the AI reading it rather than a person.
+    rule(
+        Kind::IndirectInstruction,
+        r"(?i)\b(?:if\s+you\s+are\s+(?:an?\s+)?(?:AI|LLM|large\s+language\s+model|language\s+model|AI\s+assistant|assistant|chatbot|AI\s+agent|agent|GPT|bot)\b[^.\n]{0,40}?\b(?:reading|processing|summari[sz]ing|analy[sz]ing|seeing|parsing|browsing)|(?:note|message|instructions?|attention|important)\s+(?:to|for)\s+(?:the\s+|any\s+|all\s+)?(?:AI|LLMs?|AI\s+assistants?|assistants?|language\s+models?|AI\s+agents?|agents?|chatbots?|bots?)\s*[:!-]|(?:do\s+not|don't|never)\s+(?:tell|inform|mention\s+(?:this\s+)?to|reveal\s+(?:this\s+)?to|show\s+(?:this\s+)?to|alert)\s+the\s+user\b)",
+        accept,
+    ),
+    rule(
+        Kind::IndirectInstruction,
+        r"(?i)\b(?:wenn\s+du\s+(?:eine\s+)?(?:KI|AI|Sprachmodell|Assistent)\s+bist|(?:hinweis|nachricht|anweisung(?:en)?)\s+(?:an|für)\s+(?:die\s+|den\s+)?(?:KI|AI|Assistenten|Sprachmodell)\s*[:!-]|(?:sag|erzähl)\s+(?:es\s+|das\s+)?(?:dem\s+)?(?:nutzer|benutzer)\s+nicht)",
+        accept,
+    ),
+    // An HTML comment with instructions, invisible on a rendered web page.
+    rule(
+        Kind::IndirectInstruction,
+        r"(?i)<!--[^>]{0,300}?\b(?:AI|LLM|assistant|language\s+model|agent)\b[^>]{0,300}?\b(?:ignore|instructions?|must|should|do\s+not|send|forward|include)\b[^>]{0,300}?-->",
+        accept,
+    ),
     // Model output that sends data elsewhere when a client renders it. The value
     // is the URL; the proxy skips allowed domains.
     rule(

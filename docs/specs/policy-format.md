@@ -36,6 +36,9 @@ Entity names. An empty `entities` list means all entities of that detector. When
 | `prompt_injection` | `prompt_extraction` | Requests for the system prompt: "reveal your system prompt", "repeat the words above" |
 | `prompt_injection` | `chat_template` | Chat-template control tokens in user text (`<\|im_start\|>`, `[INST]`, `<<SYS>>`) that forge a system turn |
 | `prompt_injection` | `hidden_text` | Text a person cannot see: Unicode tag characters, bidi overrides, runs of zero-width characters or variation selectors |
+| `prompt_injection` | `indirect` | Text in a document, web page, email or tool result that addresses the AI reading it: "if you are an AI reading this", "note to the assistant:", "do not tell the user", instructions in HTML comments |
+| `prompt_injection` | `obfuscated` | An attack the patterns above would catch, hidden by encoding (base64, hex, ROT13, percent and HTML escapes, Unicode tag characters), look-alike characters (Cyrillic and Greek homoglyphs, fullwidth, mathematical and circled letters, leetspeak), invisible characters, letter spacing (`i g n o r e`), words run together (`IgnoreAllPreviousInstructions`) or reversed text |
+| `prompt_injection` | `many_shot` | One message with a long written-out dialogue (8 or more turns of each side, such as `User:` and `Assistant:` lines) that primes the model to go along |
 | `prompt_injection` | `classifier` | The Tier 2 model's score is at or above `threshold`; only with `--injection-model` |
 | `exfiltration` | `markdown_image`, `html_image` | An image the client would load from an outside URL (`![x](https://...)`, `<img src="https://...">`); loading it sends whatever is in the URL to that server |
 | `exfiltration` | `url_with_data` | A link whose query carries a long encoded value (32+ characters of base64, hex or URL encoding with digits in it) |
@@ -44,6 +47,8 @@ Entity names. An empty `entities` list means all entities of that detector. When
 Context keywords must appear within 48 bytes before the value. They keep generic numbers such as order IDs from being reported as tax IDs.
 
 **Prompt injection** rules look only at text from the user and tools. Messages with the `system` or `developer` role and top-level system fields (`system`, `instructions`, `systemInstruction`) are the app's own instructions and are skipped, so a system prompt saying "never reveal your system prompt" is not an attack. PII, secret and custom rules still scan them.
+
+`obfuscated` decodes and normalizes the text, then runs the other injection patterns on the result, so it catches the same phrasings in disguise; ROT13 and reversed text are only tried when the prompt mentions them. Base64 and hex runs from 16 characters to 16 KiB are decoded, two levels deep; longer runs are files or images.
 
 The patterns are cheap and precise but only catch known phrasings, and they also match a prompt that quotes an attack to discuss it. The classifier (Tier 2) generalises to new wordings. It runs when the proxy starts with `--injection-model <dir>` and the route's `prompt_injection` entry covers the `classifier` entity (an empty `entities` list does). `threshold` (0 to 1, default 0.5) sets how sure it must be; setting it without a model is an error at startup. The classifier scores the text as a whole and cannot point at a span, so `redact` blocks for it. If it fails, the route's `fail_mode` decides. See [models](../models.md) for supported models.
 

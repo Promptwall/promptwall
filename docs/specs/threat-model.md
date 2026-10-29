@@ -35,6 +35,7 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 ## Known limits
 
 - No detector catches every injection. Promptwall reduces risk and gives visibility; it is one layer, not a guarantee. Docs must say this plainly.
+- Encoded and disguised attacks are caught when they decode to a known phrasing. Other ciphers, translations into further languages and attacks spread over several messages are left to the classifier.
 - Injection patterns (Tier 1) only catch known phrasings and also match a prompt that quotes an attack to discuss it. On public test sets they catch 3 to 30% of attacks with no false positives; the classifier (Tier 2) catches 68 to 89% with up to 4% false positives ([models](../models.md)).
 - In the default parallel mode, an injection prompt reaches the provider before the classifier blocks it; only the answer is withheld. Tools that run on the provider side can act in that window, so such routes need `parallel: false`.
 - Streamed answers are checked with a holdback window (128 characters by default). A value longer than the window, or text sent before a later finding (such as a system prompt leak that only becomes clear after ten words), may partly reach the app before the stream is cut.

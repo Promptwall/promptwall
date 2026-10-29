@@ -22,15 +22,20 @@ fn main() {
         for (label, text) in [("clean", &clean), ("with PII", &dirty), ("German", &german)] {
             let runs = 200;
             let start = Instant::now();
-            let mut found = 0;
             for _ in 0..runs {
-                found += detector.scan(text).len();
+                std::hint::black_box(detector.scan(text));
             }
             let per_scan = start.elapsed() / runs;
+            let found_once = detector.scan(text);
+            let start = Instant::now();
+            for _ in 0..runs {
+                std::hint::black_box(detector.scan_evasions(text, &found_once));
+            }
+            let per_evasion = start.elapsed() / runs;
             println!(
-                "{tokens:>6} tokens ({:>7} bytes), {label:<8}: {per_scan:>10.2?} per scan, {} findings",
+                "{tokens:>6} tokens ({:>7} bytes), {label:<8}: {per_scan:>10.2?} per scan, {per_evasion:>10.2?} evasion check, {} findings",
                 text.len(),
-                found / runs as usize
+                found_once.len()
             );
         }
     }
