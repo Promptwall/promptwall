@@ -69,6 +69,16 @@ struct Args {
     #[arg(long, env = "PROMPTWALL_METRICS_LISTEN")]
     metrics_listen: Option<SocketAddr>,
 
+    /// Only use policy files signed with the matching private key: the
+    /// signature must be in `<policy file>.sig` (see `promptwall sign`).
+    #[arg(long, global = true, env = "PROMPTWALL_POLICY_PUBLIC_KEY")]
+    policy_public_key: Option<PathBuf>,
+
+    /// Write one JSON line per request (route, action, finding labels,
+    /// timings; never prompt text) to this file, or `-` for standard output.
+    #[arg(long, env = "PROMPTWALL_DECISION_LOG")]
+    decision_log: Option<PathBuf>,
+
     /// Seconds between checks of the policy file for changes, which are
     /// applied without a restart. 0 turns reloading off.
     #[arg(long, env = "PROMPTWALL_RELOAD_INTERVAL", default_value_t = 2)]
@@ -104,13 +114,36 @@ enum Command {
         /// The text to check.
         text: String,
     },
+    /// Print the JSON Schema of the policy format.
+    Schema,
+    /// Create a key pair for signing policies: <name>.key (private, keep it
+    /// secret) and <name>.pub (for --policy-public-key).
+    Keygen {
+        #[arg(default_value = "promptwall-policy")]
+        name: String,
+    },
+    /// Sign a policy file with a private key; writes <file>.sig.
+    Sign {
+        /// The private key from `promptwall keygen`.
+        #[arg(long)]
+        key: PathBuf,
+        /// The policy file.
+        file: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    if let Some(Command::Init { file }) = &args.command {
-        return promptwall::init::run(file);
+    match &args.command {
+        Some(Command::Init { file }) => return promptwall::init::run(file),
+        Some(Command::Keygen { name }) => return keygen(name),
+        Some(Command::Schema) => {
+            print!("{}", promptwall::policy::json_schema());
+            return Ok(());
+        }
+        Some(Command::Sign { key, file }) => return sign(key, file),
+        _ => {}
     }
     // Commands other than the proxy print their own results.
     let default_filter = if args.command.is_some() {
@@ -128,8 +161,12 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("this command needs a policy file (--policy)");
     }
 
+    let public_key = match &args.policy_public_key {
+        Some(path) => Some(promptwall::signing::PublicKey::load(path)?),
+        None => None,
+    };
     let policy = match &args.policy {
-        Some(path) => promptwall::Policy::load(path)?,
+        Some(path) => promptwall::Policy::load_signed(path, public_key.as_ref())?,
         None => promptwall::Policy::passthrough(&args.upstream)?,
     };
     let routes: Vec<String> = policy.routes.iter().map(|r| r.name.clone()).collect();
@@ -190,7 +227,11 @@ async fn main() -> anyhow::Result<()> {
     let proxy = promptwall::Proxy::with_models(policy, models)?;
     match args.command {
         None => {}
-        Some(Command::Init { .. }) => unreachable!("handled above"),
+        Some(
+            Command::Init { .. } | Command::Keygen { .. } | Command::Sign { .. } | Command::Schema,
+        ) => {
+            unreachable!("handled above")
+        }
         Some(Command::Validate) => {
             println!("policy is valid: {}", routes.join(", "));
             return Ok(());
@@ -232,6 +273,10 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     }
+    if let Some(target) = &args.decision_log {
+        promptwall::decision::init(target)?;
+        tracing::info!(target = %target.display(), "decision log on");
+    }
     if let Some(addr) = args.metrics_listen {
         let (listener, addr) = promptwall::bind(addr).await?;
         tracing::info!(%addr, "metrics on /metrics");
@@ -241,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(promptwall::reload::watch(
             proxy.clone(),
             path,
+            public_key,
             std::time::Duration::from_secs(args.reload_interval),
         ));
     }
@@ -253,4 +299,55 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("shutting down");
         })
         .await
+}
+
+fn keygen(name: &str) -> anyhow::Result<()> {
+    let (private, public) = promptwall::signing::generate()?;
+    let (key_path, pub_path) = (format!("{name}.key"), format!("{name}.pub"));
+    for path in [&key_path, &pub_path] {
+        anyhow::ensure!(
+            !std::path::Path::new(path).exists(),
+            "{path} exists; not overwriting it"
+        );
+    }
+    write_private(&key_path, &private)?;
+    std::fs::write(&pub_path, public + "\n")?;
+    println!("Wrote {key_path} (private: keep it secret, use it with `promptwall sign`)");
+    println!("Wrote {pub_path} (public: start the proxy with --policy-public-key {pub_path})");
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private(path: &str, key: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    writeln!(file, "{key}")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &str, key: &str) -> anyhow::Result<()> {
+    std::fs::write(path, format!("{key}\n"))?;
+    Ok(())
+}
+
+fn sign(key: &std::path::Path, file: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let private = std::fs::read_to_string(key)
+        .with_context(|| format!("cannot read private key {}", key.display()))?;
+    let content = std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?;
+    let text = std::str::from_utf8(&content).context("the policy file is not UTF-8")?;
+    // Never sign a policy the proxy would reject.
+    promptwall::Policy::from_yaml(text)
+        .with_context(|| format!("invalid policy file {}", file.display()))?;
+    let signature = promptwall::signing::sign(&private, &content)?;
+    let sig_path = promptwall::signing::signature_path(file);
+    std::fs::write(&sig_path, signature + "\n")?;
+    println!("Wrote {}", sig_path.display());
+    Ok(())
 }

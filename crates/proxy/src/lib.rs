@@ -5,6 +5,7 @@
 //! body once, run the Tier 1 detectors and then forward, redact or block.
 //! Responses are always streamed back without buffering.
 
+pub mod decision;
 pub mod init;
 pub mod inspect;
 pub mod limits;
@@ -14,6 +15,7 @@ pub mod ner;
 pub mod output;
 pub mod policy;
 pub mod reload;
+pub mod signing;
 pub mod tools;
 
 use std::convert::Infallible;
@@ -52,6 +54,8 @@ const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 
 /// Response header telling the client what Promptwall did (not set in shadow mode).
 const ACTION_HEADER: &str = "x-promptwall-action";
+/// The ID of the request in the decision log.
+const REQUEST_ID_HEADER: &str = "x-promptwall-request-id";
 
 /// Headers that apply to a single connection and must not be forwarded
 /// (RFC 9110, section 7.6.1).
@@ -168,15 +172,26 @@ impl Proxy {
             return Ok(text(StatusCode::OK, "ok\n"));
         }
         let started = Instant::now();
-        let route = self
-            .policy()
+        let policy = self.policy();
+        let (route, shadow) = policy
             .route(req.uri().path(), req.headers())
-            .map_or_else(String::new, |r| r.name.clone());
-        let resp = self.handle_request(req).await?;
+            .map_or_else(|| (String::new(), false), |r| (r.name.clone(), r.shadow));
+        let record = decision::enabled().then(|| decision::Record::new(&policy.digest));
+        drop(policy);
+        let mut resp = match &record {
+            Some(record) => decision::scope(record.clone(), self.handle_request(req)).await?,
+            None => self.handle_request(req).await?,
+        };
         let action = match (resp.status(), resp.headers().get(ACTION_HEADER)) {
             (StatusCode::TOO_MANY_REQUESTS, _) => "rate_limited",
             (StatusCode::NOT_FOUND, _) if route.is_empty() => "no_route",
-            (_, Some(v)) => v.to_str().unwrap_or("allow"),
+            (_, Some(v)) => match v.as_bytes() {
+                b"flag" => "flag",
+                b"redact" => "redact",
+                b"block" => "block",
+                _ => "allow",
+            },
+            (StatusCode::FORBIDDEN, None) => "block",
             (StatusCode::BAD_GATEWAY, None) => "error",
             _ => "allow",
         };
@@ -190,6 +205,26 @@ impl Proxy {
             &[("route", &route)],
             started.elapsed(),
         );
+        if let Some(record) = record {
+            record.update(|e| {
+                e.route = route;
+                e.action = action;
+                e.shadow = shadow;
+                e.status = resp.status().as_u16();
+            });
+            record.headers_sent();
+            if let Ok(id) = HeaderValue::from_str(&record.id()) {
+                resp.headers_mut().insert(REQUEST_ID_HEADER, id);
+            }
+            // The event is written once the whole response has been sent.
+            resp = resp.map(|body| {
+                body.map_frame(move |frame| {
+                    let _ = &record;
+                    frame
+                })
+                .boxed()
+            });
+        }
         Ok(resp)
     }
 
@@ -259,6 +294,7 @@ impl Proxy {
                 safety: rules.safety.clone().zip(self.inner.models.safety.clone()),
                 pii: rules.pii.clone().zip(self.inner.models.pii.clone()),
                 prompt: String::new(),
+                decision: decision::current(),
             }));
         }
 
@@ -312,6 +348,7 @@ impl Proxy {
             &[("route", &route.name), ("stage", "rules")],
             checking.elapsed(),
         );
+        decision::check_time("rules", checking.elapsed());
         let mut outcome = match outcome {
             Ok(mut outcome) => {
                 if let Some(rules) = &route.tools {
@@ -335,6 +372,7 @@ impl Proxy {
                         safety: output_safety.zip(models.safety.clone()),
                         pii: rules.pii.clone().zip(models.pii.clone()),
                         prompt: last_chars(&outcome.untrusted_text, PROMPT_CONTEXT).to_owned(),
+                        decision: decision::current(),
                     }));
                 }
                 outcome
@@ -360,6 +398,7 @@ impl Proxy {
                     &[("route", &route.name), ("stage", "models")],
                     tagging.elapsed(),
                 );
+                decision::check_time("models", tagging.elapsed());
                 match tagged {
                     Ok(Ok((tagged, new_body))) => add_tagged(&mut outcome, tagged, new_body),
                     Ok(Err(err)) => {
@@ -475,6 +514,7 @@ impl Proxy {
             &[("route", &route.name), ("direction", "request")],
             1,
         );
+        decision::note(|e| e.request.uninspected = true);
         if route.fail_mode == FailMode::Closed && !route.shadow {
             return uninspectable();
         }
@@ -553,6 +593,7 @@ impl Proxy {
                     safety: rules.safety.clone().zip(models.safety.clone()),
                     pii: rules.pii.clone().zip(models.pii.clone()),
                     prompt: String::new(),
+                    decision: None,
                 };
                 return output::check_text(&check, text);
             }
@@ -827,6 +868,7 @@ async fn tier2_verdict(
                 &[("route", &route.name), ("stage", "models")],
                 elapsed,
             );
+            decision::check_time("models", elapsed);
             tracing::debug!(route = %route.name, ?found, elapsed_us = elapsed.as_micros() as u64, "tier 2 models");
             Some(found)
         }
@@ -850,6 +892,7 @@ fn add_model_findings(outcome: &mut inspect::Outcome, found: &[(String, Action)]
 
 fn log_findings(route: &policy::Route, action: Action, outcome: &inspect::Outcome) {
     metrics::findings(&route.name, "request", &outcome.findings);
+    decision::note(|e| e.request.record(action, &outcome.findings));
     tracing::info!(
         route = %route.name,
         action = action.as_str(),

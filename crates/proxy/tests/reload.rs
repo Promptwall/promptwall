@@ -37,7 +37,7 @@ fn applies_changes_and_keeps_the_old_policy_on_errors() {
     let path = dir.join("policy.yaml");
     std::fs::write(&path, policy("redact", 10)).unwrap();
     let proxy = Proxy::with_policy(Policy::load(&path).unwrap()).unwrap();
-    let mut watcher = Watcher::new(&path);
+    let mut watcher = Watcher::new(&path, None);
     let limiter = |p: &Proxy| p.policy().routes[0].limits.clone().unwrap();
     let first = limiter(&proxy);
 
