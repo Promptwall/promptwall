@@ -14,6 +14,7 @@
 | `routes[].input` with `detector: prompt_injection`, `entities`, `threshold`, `parallel`, `action` | Yes |
 | `routes[].output` with `detector: pii`, `secrets`, `custom`, `exfiltration` (`allow_domains`), `system_prompt_leak` (`min_words`), `action`; `routes[].stream_holdback` | Yes |
 | `routes[].tools` with `allow`, `deny`, `arguments` (`tool`, `field`, `allow`, `deny`, `allow_domains`), `action: block \| flag` | Yes |
+| `routes[].input` with `detector: content_safety` (`entities`, `threshold`) or `detector: topics` (`deny`, `allow`, `threshold`); `routes[].output` with `detector: content_safety` | Yes, with `--safety-model` / `--topic-model` |
 | `mode: indirect`, `untrusted_content`, `rules`, `limits`, `tests` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
@@ -77,9 +78,31 @@ input:
     action: block
 ```
 
+## Content policy
+
+Two detectors use Tier 2 models ([models](../models.md)) to check what a request or answer is about.
+
+```yaml
+input:
+  - detector: content_safety       # harmful requests: weapons, self-harm, hate, ...
+    entities: [weapons, self_harm, sexual_minors]   # empty: any harmful content
+    threshold: 0.8
+    action: block
+  - detector: topics
+    allow: [banking, personal finance]   # off-topic requests are rejected
+    deny: [politics, medical advice]
+    threshold: 0.5
+    action: block
+output:
+  - detector: content_safety       # harmful answers
+    action: block
+```
+
+`content_safety` findings are `safety.<category>` (or `safety.unsafe`). `entities` lists the categories that count; the loaded model decides which exist, and an unknown one is an error at startup. `topics` gives `topic.denied` when the prompt is about a denied topic, and `topic.off_topic` when the route has allowed topics and the prompt is about none of them. Both check only text from the user and tools, not the system prompt. They run alongside the provider call like the injection classifier: `parallel` on `prompt_injection` applies to them too. The models cannot point at a span, so `redact` blocks. If a model fails, the route's `fail_mode` decides.
+
 ## Response checks
 
-`output` detectors check what the provider answers before the app sees it. `pii`, `secrets` and `custom` work as on input; `exfiltration` and `system_prompt_leak` exist only here, and `prompt_injection` only on input.
+`output` detectors check what the provider answers before the app sees it. `pii`, `secrets`, `custom` and `content_safety` work as on input; `exfiltration` and `system_prompt_leak` exist only here, and `prompt_injection` and `topics` only on input.
 
 ```yaml
 output:

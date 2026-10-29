@@ -19,7 +19,8 @@ use hyper::body::{Frame, Incoming};
 use promptwall_detect::{Category, Finding, Kind, SystemPromptIndex};
 use serde_json::Value;
 
-use crate::policy::{Action, OutputRules};
+use crate::moderation::Safety;
+use crate::policy::{Action, OutputRules, SafetyRule};
 use crate::tools::{StreamCalls, ToolCall, ToolRules};
 use crate::{full, json_error, ProxyBody, ACTION_HEADER, MAX_BODY_BYTES, MAX_SCAN_BYTES};
 
@@ -34,6 +35,10 @@ pub struct OutputCheck {
     pub system: Option<SystemPromptIndex>,
     /// Limits on the tool calls in the answer.
     pub tools: Option<Arc<ToolRules>>,
+    /// Harmful content in the answer, with the model that judges it.
+    pub safety: Option<(SafetyRule, Arc<Safety>)>,
+    /// The end of the request's prompt, to judge the answer in context.
+    pub prompt: String,
 }
 
 impl OutputCheck {
@@ -215,21 +220,43 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
         }
     };
     let mut tool_action = None;
+    // The answer's text, for the moderation model.
+    let mut answer = String::new();
     let new_body = if let Ok(mut json) = serde_json::from_slice::<Value>(&bytes) {
-        crate::inspect::visit_strings(&mut json, None, false, &mut |s, _, _| apply(s));
+        crate::inspect::visit_strings(&mut json, None, false, &mut |s, key, _| {
+            if check.safety.is_some() && key.is_some_and(|k| ANSWER_KEYS.contains(&k)) {
+                answer.push_str(s);
+                answer.push('\n');
+            }
+            apply(s)
+        });
         let mut tool_findings = BTreeMap::new();
         tool_action = check.check_tools(&crate::tools::calls(&json), &mut tool_findings);
         findings.extend(tool_findings);
         changed.then(|| Bytes::from(serde_json::to_vec(&json).unwrap_or_default()))
     } else if let Ok(text) = std::str::from_utf8(&bytes) {
         let mut text = text.to_owned();
+        if check.safety.is_some() {
+            answer = text.clone();
+        }
         apply(&mut text);
         changed.then(|| Bytes::from(text))
     } else {
         return unscannable(&check, parts, full(bytes));
     };
+    let safety_action = match judge(&check, answer).await {
+        Ok(Some((labels, action))) => {
+            for label in labels {
+                *findings.entry(label).or_insert(0) += 1;
+            }
+            Some(action)
+        }
+        Ok(None) => None,
+        Err(()) if check.fail_closed && !check.shadow => return unjudged(),
+        Err(()) => None,
+    };
 
-    let Some(action) = action.max(tool_action) else {
+    let Some(action) = action.max(tool_action).max(safety_action) else {
         return Response::from_parts(parts, full(bytes));
     };
     check.log(action, &findings, false);
@@ -254,6 +281,45 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
             .insert(ACTION_HEADER, HeaderValue::from_static(action.as_str()));
     }
     Response::from_parts(parts, full(body))
+}
+
+/// JSON keys whose strings are the text of an answer (`content`, `text`),
+/// as opposed to IDs, roles or tool arguments.
+const ANSWER_KEYS: [&str; 2] = ["content", "text"];
+
+/// Runs the moderation model on `text`, if the route has `content_safety` on
+/// its answers. `Ok(None)` when the text is fine, `Err` when the model failed.
+async fn judge(
+    check: &Arc<OutputCheck>,
+    text: String,
+) -> Result<Option<(Vec<String>, Action)>, ()> {
+    let Some((rule, model)) = check.safety.clone() else {
+        return Ok(None);
+    };
+    let prompt = check.prompt.clone();
+    let action = rule.action;
+    let task = tokio::task::spawn_blocking(move || model.check(&text, Some(&prompt), &rule));
+    match task.await {
+        Ok(Ok(labels)) if labels.is_empty() => Ok(None),
+        Ok(Ok(labels)) => Ok(Some((labels, action))),
+        Ok(Err(err)) => {
+            tracing::warn!(route = %check.route, error = %format!("{err:#}"), "safety model failed on the answer");
+            Err(())
+        }
+        Err(err) => {
+            tracing::warn!(route = %check.route, error = %err, "safety model panicked on the answer");
+            Err(())
+        }
+    }
+}
+
+fn unjudged() -> Response<ProxyBody> {
+    json_error(
+        StatusCode::BAD_GATEWAY,
+        "promptwall_uninspectable",
+        "Response blocked by Promptwall: it could not be checked",
+        &[],
+    )
 }
 
 fn blocked_response(findings: &BTreeMap<String, usize>) -> Response<ProxyBody> {
@@ -338,7 +404,13 @@ struct Sse {
     finished: bool,
     /// Tool calls seen so far, when the route limits them.
     calls: StreamCalls,
+    /// Text up to here has passed the moderation model.
+    judged: usize,
 }
+
+/// How much new answer text the moderation model waits for before it judges
+/// a streamed answer again, in bytes. Text is released only once judged.
+const JUDGE_EVERY: usize = 256;
 
 /// JSON keys whose string values are answer text in streamed events (OpenAI
 /// chat `delta.content`, Responses `delta`, Anthropic `delta.text`, Gemini
@@ -360,6 +432,7 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
         action: None,
         finished: false,
         calls: StreamCalls::default(),
+        judged: 0,
     };
     let events = futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -375,7 +448,7 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
                 Some(Ok(frame)) => match frame.into_data() {
                     Ok(data) => {
                         state.buf.extend_from_slice(&data);
-                        let out = state.take_events(false);
+                        let out = state.take_events(false).await;
                         if !out.is_empty() {
                             return Some((Ok(Frame::data(out)), state));
                         }
@@ -388,7 +461,7 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
                 }
                 None => {
                     state.upstream = None;
-                    let out = state.take_events(true);
+                    let out = state.take_events(true).await;
                     if !out.is_empty() {
                         return Some((Ok(Frame::data(out)), state));
                     }
@@ -401,11 +474,32 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
 
 impl Sse {
     /// Parses complete events from the buffer, scans, and returns what may be sent.
-    fn take_events(&mut self, at_end: bool) -> Bytes {
+    async fn take_events(&mut self, at_end: bool) -> Bytes {
         while let Some(raw) = next_event(&mut self.buf, at_end) {
             self.push(raw);
         }
         self.scan(at_end);
+        let due = at_end || self.text.len() >= self.judged + JUDGE_EVERY;
+        if self.check.safety.is_some() && due && self.text.len() > self.judged {
+            match judge(&self.check, self.text.clone()).await {
+                Ok(Some((labels, action))) => {
+                    for label in labels {
+                        *self.findings.entry(label).or_insert(0) += 1;
+                    }
+                    self.action = self.action.max(Some(action));
+                }
+                Ok(None) => {}
+                Err(()) if self.check.fail_closed => {
+                    *self
+                        .findings
+                        .entry("safety.unchecked".to_owned())
+                        .or_insert(0) += 1;
+                    self.action = Some(Action::Block);
+                }
+                Err(()) => {}
+            }
+            self.judged = self.text.len();
+        }
         let text_blocked = self.action == Some(Action::Block);
         if at_end && !self.calls.is_empty() {
             let action = self
@@ -437,7 +531,7 @@ impl Sse {
             out.extend_from_slice(format!("event: error\ndata: {error}\n\n").as_bytes());
             return out.freeze();
         }
-        let release_to = if at_end {
+        let mut release_to = if at_end {
             self.text.len()
         } else {
             floor_char(
@@ -445,6 +539,10 @@ impl Sse {
                 self.text.len().saturating_sub(self.check.rules.holdback),
             )
         };
+        if self.check.safety.is_some() {
+            // Only text the moderation model has seen goes out.
+            release_to = release_to.min(self.judged);
+        }
         let mut out = BytesMut::new();
         while self
             .pending

@@ -86,6 +86,29 @@ pub struct Route {
     pub output: Option<Arc<OutputRules>>,
     /// Which tools the model may be offered and call, if limited.
     pub tools: Option<Arc<ToolRules>>,
+    /// Harmful content in the request (Tier 2 moderation model).
+    pub safety: Option<SafetyRule>,
+    /// Allowed and denied topics of the request (Tier 2 zero-shot model).
+    pub topics: Option<TopicRule>,
+}
+
+/// A `content_safety` entry.
+#[derive(Clone, Debug)]
+pub struct SafetyRule {
+    /// Categories that count; empty means any harmful content.
+    pub categories: Vec<String>,
+    /// Overrides the model's own threshold.
+    pub threshold: Option<f32>,
+    pub action: Action,
+}
+
+/// A `topics` entry.
+#[derive(Clone, Debug)]
+pub struct TopicRule {
+    pub deny: Vec<String>,
+    pub allow: Vec<String>,
+    pub threshold: f32,
+    pub action: Action,
 }
 
 /// The `output` detectors of a route.
@@ -100,6 +123,8 @@ pub struct OutputRules {
     /// Characters of a streamed answer held back so that a value split across
     /// chunks is still seen whole before it is sent on.
     pub holdback: usize,
+    /// Harmful content in the answer (Tier 2 moderation model).
+    pub safety: Option<SafetyRule>,
 }
 
 /// Default for `min_words` on `system_prompt_leak`.
@@ -122,16 +147,19 @@ impl Route {
     }
 
     pub fn inspects_input(&self) -> bool {
-        !self.input.is_empty()
+        !self.input.is_empty() || self.safety.is_some() || self.topics.is_some()
     }
 
     /// Whether the request body must be read: to inspect it, to check the
     /// tools it offers, or to learn the system prompt that the leak check
-    /// compares the answer with.
+    /// compares the answer with and the prompt the answer is judged with.
     pub fn reads_request(&self) -> bool {
         self.inspects_input()
             || self.tools.is_some()
-            || self.output.as_ref().is_some_and(|o| o.leak_words.is_some())
+            || self
+                .output
+                .as_ref()
+                .is_some_and(|o| o.leak_words.is_some() || o.safety.is_some())
     }
 
     /// Threshold and action for the injection classifier, if this route uses it.
@@ -187,6 +215,8 @@ impl Policy {
                 classifier_parallel: true,
                 output: None,
                 tools: None,
+                safety: None,
+                topics: None,
             }],
         })
     }
@@ -237,6 +267,8 @@ impl Policy {
                 detector,
                 threshold,
                 parallel,
+                safety,
+                topics,
                 ..
             } = compile_detectors(&spec.input, Side::Input)
                 .with_context(|| format!("route {name:?} input"))?;
@@ -260,6 +292,7 @@ impl Policy {
                         allow_domains: Vec::new(),
                         leak_words: None,
                         holdback: DEFAULT_HOLDBACK,
+                        safety: None,
                     })
                 })
             } else {
@@ -271,6 +304,7 @@ impl Policy {
                     allow_domains: out.allow_domains,
                     leak_words: out.leak_words,
                     holdback: spec.stream_holdback.unwrap_or(DEFAULT_HOLDBACK),
+                    safety: out.safety,
                 }))
             };
             routes.push(Route {
@@ -288,6 +322,8 @@ impl Policy {
                 classifier_parallel: parallel.unwrap_or(true),
                 output,
                 tools,
+                safety,
+                topics,
                 name,
             });
         }
@@ -306,6 +342,8 @@ struct Compiled {
     parallel: Option<bool>,
     allow_domains: Vec<String>,
     leak_words: Option<usize>,
+    safety: Option<SafetyRule>,
+    topics: Option<TopicRule>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -324,6 +362,8 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
     let mut parallel = None;
     let mut allow_domains = Vec::new();
     let mut leak_words = None;
+    let mut safety = None;
+    let mut topics = None;
     for spec in specs {
         match (spec.detector, side) {
             (DetectorName::PromptInjection, Side::Output) => {
@@ -361,16 +401,69 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         }
         if let Some(t) = spec.threshold {
             ensure!(
-                matches!(spec.detector, DetectorName::PromptInjection),
-                "threshold is only allowed on the prompt_injection detector"
+                matches!(
+                    spec.detector,
+                    DetectorName::PromptInjection | DetectorName::ContentSafety | DetectorName::Topics
+                ),
+                "threshold is only allowed on the prompt_injection, content_safety and topics detectors"
             );
             ensure!(
                 (0.0..=1.0).contains(&t),
                 "threshold must be between 0 and 1"
             );
+        }
+        ensure!(
+            matches!(spec.detector, DetectorName::Topics)
+                || (spec.deny.is_empty() && spec.allow.is_empty()),
+            "deny and allow are only allowed on the topics detector"
+        );
+        // Model-based content checks: one entry each, without finding kinds.
+        // The classifier cannot point at a span, so redact blocks.
+        let model_action = match spec.action {
+            Action::Redact => Action::Block,
+            action => action,
+        };
+        match spec.detector {
+            DetectorName::ContentSafety => {
+                ensure!(safety.is_none(), "content_safety is listed twice");
+                safety = Some(SafetyRule {
+                    categories: spec.entities.clone(),
+                    threshold: spec.threshold,
+                    action: model_action,
+                });
+                continue;
+            }
+            DetectorName::Topics => {
+                ensure!(
+                    side == Side::Input,
+                    "topics checks requests; use it under input"
+                );
+                ensure!(topics.is_none(), "topics is listed twice");
+                ensure!(
+                    spec.entities.is_empty(),
+                    "topics has no entities; use deny and allow"
+                );
+                ensure!(
+                    !(spec.deny.is_empty() && spec.allow.is_empty()),
+                    "topics needs deny or allow"
+                );
+                topics = Some(TopicRule {
+                    deny: spec.deny.clone(),
+                    allow: spec.allow.clone(),
+                    threshold: spec
+                        .threshold
+                        .unwrap_or(crate::moderation::DEFAULT_THRESHOLD),
+                    action: model_action,
+                });
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(t) = spec.threshold {
             threshold.get_or_insert(t);
         }
         let category = match spec.detector {
+            DetectorName::ContentSafety | DetectorName::Topics => unreachable!("handled above"),
             DetectorName::Pii => Category::Pii,
             DetectorName::Secrets => Category::Secret,
             DetectorName::PromptInjection => Category::Injection,
@@ -436,6 +529,8 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         parallel,
         allow_domains,
         leak_words,
+        safety,
+        topics,
     })
 }
 
@@ -576,6 +671,12 @@ struct DetectorFile {
     allow_domains: Option<Vec<String>>,
     /// system_prompt_leak only: words in a row that count as a leak.
     min_words: Option<usize>,
+    /// topics only: topics that are not allowed.
+    #[serde(default)]
+    deny: Vec<String>,
+    /// topics only: the topics a request must be about.
+    #[serde(default)]
+    allow: Vec<String>,
     action: Action,
 }
 
@@ -588,6 +689,8 @@ enum DetectorName {
     Exfiltration,
     SystemPromptLeak,
     Custom,
+    ContentSafety,
+    Topics,
 }
 
 #[cfg(test)]

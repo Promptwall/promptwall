@@ -28,6 +28,13 @@ routes:
         action: block
       - detector: pii
         action: redact
+      # With --safety-model and --topic-model (see docs/models.md):
+      # - detector: content_safety
+      #   threshold: 0.8
+      #   action: block
+      # - detector: topics
+      #   deny: [politics, medical advice]
+      #   action: block
 
   - name: openai
     upstream: openai
