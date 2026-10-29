@@ -201,7 +201,7 @@ The checks run in two places:
 
 Argument values also pass through the route's `output` detectors, so a secret or personal data in a tool argument is caught there.
 
-`fail_mode` applies to request bodies that cannot be inspected: compressed bodies, bodies over 4 MiB, and binary bodies. Bodies over 32 MiB are always rejected with `413`.
+`fail_mode` applies to request bodies that cannot be inspected: compressed bodies and bodies over 4 MiB. Bytes that are not valid UTF-8 are read as U+FFFD and the rest of the body is checked as usual, so mis-encoded or binary text cannot slip past the checks; a redacted body is sent on as valid UTF-8. Bodies over 32 MiB are always rejected with `413`.
 
 See [`examples/policy.yaml`](../../examples/policy.yaml) for a working file.
 

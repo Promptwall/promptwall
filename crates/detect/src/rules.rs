@@ -201,6 +201,14 @@ pub(crate) const RULES: &[Spec] = &[
         r"(?i)\b(?:ignore|disregard|forget)\s+(?:all|everything)\s+(?:that\s+)?(?:above|before|you\s+(?:were|have\s+been)\s+(?:told|given|instructed))\b",
         accept,
     ),
+    // "Forget the other instructions." / "Ignore all rules and ..." / "Disregard
+    // your guidelines": no "previous", but the phrase ends there, unlike
+    // "ignore the instructions on the box".
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignore|disregard|forget|override|bypass)\s+(?:(?:all|any|every|the|your|these|those|other|existing|current|my|of)\s+){1,3}(?:instructions|rules|guidelines|directives|guardrails|restrictions|programming|constraints)(?:\s*(?:[.!;:,]|$)|\s+(?:and|then|now)\b)",
+        accept,
+    ),
     rule(
         Kind::IgnorePrevious,
         r"(?i)\b(?:ignorier\w*|vergiss|vergessen\s+sie|missacht\w*)\s+(?:\S+\s+){0,2}?(?:alle|vorherigen|vorigen|bisherigen|obigen|früheren|ursprünglichen|deine|ihre)\s+(?:\S+\s+)?(?:anweisungen|instruktionen|befehle|regeln|vorgaben|systemanweisungen)\b",

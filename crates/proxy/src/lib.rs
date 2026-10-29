@@ -831,14 +831,16 @@ fn tag_body(
     rule: &policy::PiiRule,
     body: &[u8],
 ) -> anyhow::Result<(ner::Tagged, Option<Bytes>)> {
-    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) {
+    // Not UTF-8: read as U+FFFD, as the rules do.
+    let text = String::from_utf8_lossy(body);
+    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
         let tagged = model.tag_json(rule, &mut json, &inspect::PROMPT_KEYS)?;
         let new_body = tagged
             .changed
             .then(|| Bytes::from(serde_json::to_vec(&json).unwrap_or_default()));
         return Ok((tagged, new_body));
     }
-    let mut text = String::from_utf8_lossy(body).into_owned();
+    let mut text = text.into_owned();
     let tagged = model.tag_text(rule, &mut text)?;
     let new_body = tagged.changed.then(|| Bytes::from(text));
     Ok((tagged, new_body))
