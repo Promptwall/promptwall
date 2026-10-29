@@ -33,6 +33,8 @@ First measurement of the pass-through proxy (29 Oct 2026, 4 vCPU cloud VM, mock 
 | 200 req/s, 2,000-token prompts | 0.54 ms | 0.63 ms |
 | 1,000 req/s, 8,000-token prompts | 0.26 ms | 0.42 ms |
 
+With PII and secret detection on (`BENCH_POLICY=scripts/bench-policy.yaml`), the added latency stays inside the measurement noise of about ±0.5 ms. The detectors on their own (`cargo run --release -p promptwall-detect --example scan_speed`) take about 25 µs for a 2,000-token prompt and 100 µs for 8,000 tokens; with findings to validate, about twice that.
+
 Streamed runs add about 0.2 ms at p50; their tail percentiles are dominated by timer jitter in the mock's 20 ms chunk gaps, so the gate uses non-streamed runs for now.
 
 ### Reference hardware
@@ -48,7 +50,7 @@ Results are reported for a 2 vCPU, 4 GB x86 VM and a 2 vCPU ARM VM. CI runs a re
 
 CI fails a pull request if p95 regresses by more than 10% against `main`, or exceeds a target.
 
-Current state: CI fails if the pass-through adds more than 5 ms at p95 on a shared GitHub runner. The regression-against-`main` comparison and the tighter targets come with dedicated benchmark runners.
+Current state: CI fails if the proxy adds more than 5 ms at p95 on a shared GitHub runner, both as a pass-through and with PII and secret detection on. The regression-against-`main` comparison and the tighter targets come with dedicated benchmark runners.
 
 ## Accuracy
 

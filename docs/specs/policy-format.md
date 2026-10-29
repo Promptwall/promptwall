@@ -1,6 +1,24 @@
 # Policy format
 
-**Status:** draft for review. Field names may change before Phase 1 ships; after the first release the format is versioned and backwards compatible within a major version.
+**Status:** draft, partly implemented. Field names may change before Phase 1 ships; after the first release the format is versioned and backwards compatible within a major version.
+
+## Implemented today
+
+| Field | Supported |
+| --- | --- |
+| `version`, `defaults.fail_mode`, `defaults.shadow` | Yes |
+| `upstreams.<name>.url` | Yes (scheme and host only, no path) |
+| `routes[].name`, `match.path` (prefix), `match.header` (exact value), `upstream`, `fail_mode`, `shadow` | Yes |
+| `routes[].input` with `detector: pii` or `secrets`, `entities`, `action: block \| redact \| flag` | Yes |
+| `threshold`, `prompt_injection`, `untrusted_content`, `output`, `rules`, `limits`, `tests` | Not yet |
+
+Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
+
+Entity names: `pii`: `email`, `phone` (international `+` format only), `iban` (checksum verified), `credit_card` (network prefix and Luhn verified). `secrets`: `openai_key`, `anthropic_key`, `aws_access_key`, `github_token`, `slack_token`, `stripe_key`, `google_api_key`, `private_key`, `jwt`. An empty `entities` list means all entities of that detector. When several entries cover the same entity, the first one wins.
+
+`fail_mode` applies to request bodies that cannot be inspected: compressed bodies, bodies over 4 MiB, and binary bodies. Bodies over 32 MiB are always rejected with `413`.
+
+See [`examples/policy.yaml`](../../examples/policy.yaml) for a working file.
 
 A policy is a YAML file. It defines **routes** (which traffic it applies to), the **detectors** that run on each route, and the **action** taken when a detector fires.
 

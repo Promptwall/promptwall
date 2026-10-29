@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/proxy", "crates/mock-upstream", "crates/bench"]
+members = ["crates/detect", "crates/proxy", "crates/mock-upstream", "crates/bench"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/promptwall/promptwall"
-rust-version = "1.80"
+rust-version = "1.82"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -19,7 +19,9 @@ hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio", "http1", "http2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

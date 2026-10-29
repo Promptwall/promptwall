@@ -1,22 +1,25 @@
 //! Promptwall data plane.
 //!
-//! This first version is a transparent pass-through proxy: it forwards every
-//! request to one upstream and streams the response back without buffering.
-//! Detectors plug into [`Proxy::handle`] in later phases; keeping the
-//! pass-through path lean is what the latency benchmark measures.
+//! The proxy routes each request by its [`Policy`]. Routes without detectors
+//! stream the body straight through; routes with detectors read the request
+//! body once, run the Tier 1 detectors and then forward, redact or block.
+//! Responses are always streamed back without buffering.
+
+pub mod inspect;
+pub mod policy;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use bytes::Bytes;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
-use http::uri::{Authority, PathAndQuery, Scheme};
+use http::uri::PathAndQuery;
 use http::{Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_rustls::HttpsConnector;
@@ -24,9 +27,21 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use promptwall_detect::Detector;
 use tokio::net::TcpListener;
 
+pub use policy::Policy;
+use policy::{Action, FailMode};
+
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
+
+/// Largest request body accepted on an inspected route.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Largest request body that is scanned; larger ones follow the route's fail mode.
+const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
+/// Response header telling the client what Promptwall did (not set in shadow mode).
+const ACTION_HEADER: &str = "x-promptwall-action";
 
 /// Headers that apply to a single connection and must not be forwarded
 /// (RFC 9110, section 7.6.1).
@@ -46,25 +61,19 @@ pub struct Proxy {
 }
 
 struct Inner {
-    scheme: Scheme,
-    authority: Authority,
-    host: HeaderValue,
-    client: Client<HttpsConnector<HttpConnector>, Incoming>,
+    policy: Policy,
+    detector: Detector,
+    client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
 
 impl Proxy {
-    /// Creates a proxy that forwards to `upstream`, for example
-    /// `https://api.openai.com`. Only the scheme and authority are used.
+    /// Creates a proxy that forwards everything to `upstream`, for example
+    /// `https://api.openai.com`, without inspection.
     pub fn new(upstream: &str) -> anyhow::Result<Self> {
-        let uri: Uri = upstream.parse().context("invalid upstream URL")?;
-        let (Some(scheme), Some(authority)) = (uri.scheme().cloned(), uri.authority().cloned())
-        else {
-            bail!("upstream URL must include a scheme and host, e.g. https://api.openai.com");
-        };
-        if uri.path() != "/" && !uri.path().is_empty() {
-            bail!("upstream URL must not include a path");
-        }
+        Self::with_policy(Policy::passthrough(upstream)?)
+    }
 
+    pub fn with_policy(policy: Policy) -> anyhow::Result<Self> {
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
         http.enforce_http(false);
@@ -82,19 +91,26 @@ impl Proxy {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                host: HeaderValue::from_str(authority.as_str())?,
-                scheme,
-                authority,
+                policy,
+                detector: Detector::new(),
                 client,
             }),
         })
     }
 
-    /// Handles one request. Never fails: upstream errors become a 502.
+    /// Handles one request. Never fails: errors become an HTTP error response.
     pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<ProxyBody>, Infallible> {
         if req.uri().path() == "/healthz" {
             return Ok(text(StatusCode::OK, "ok\n"));
         }
+        let Some(route) = self.inner.policy.route(req.uri().path(), req.headers()) else {
+            return Ok(json_error(
+                StatusCode::NOT_FOUND,
+                "promptwall_no_route",
+                "No Promptwall route matches this request",
+                &[],
+            ));
+        };
 
         let (mut parts, body) = req.into_parts();
         let path = parts
@@ -103,8 +119,8 @@ impl Proxy {
             .cloned()
             .unwrap_or_else(|| PathAndQuery::from_static("/"));
         parts.uri = match Uri::builder()
-            .scheme(self.inner.scheme.clone())
-            .authority(self.inner.authority.clone())
+            .scheme(route.upstream.scheme.clone())
+            .authority(route.upstream.authority.clone())
             .path_and_query(path)
             .build()
         {
@@ -114,22 +130,101 @@ impl Proxy {
         // The client picks the upstream HTTP version; the inbound one may differ.
         parts.version = http::Version::HTTP_11;
         strip_hop_by_hop(&mut parts.headers);
-        parts.headers.insert(header::HOST, self.inner.host.clone());
+        parts
+            .headers
+            .insert(header::HOST, route.upstream.host.clone());
 
-        match self
-            .inner
-            .client
-            .request(Request::from_parts(parts, body))
-            .await
-        {
+        if !route.inspects_input() {
+            return Ok(self
+                .forward(Request::from_parts(parts, body.boxed()), None)
+                .await);
+        }
+
+        let compressed = parts
+            .headers
+            .get(header::CONTENT_ENCODING)
+            .is_some_and(|v| v != "identity");
+        let body = match Limited::new(body, MAX_BODY_BYTES).collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => {
+                return Ok(json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "promptwall_body_too_large",
+                    "Request body is too large or could not be read",
+                    &[],
+                ))
+            }
+        };
+
+        let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
+            Err(inspect::Unscannable)
+        } else {
+            inspect::inspect(&self.inner.detector, &route.input, &body)
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(inspect::Unscannable) => {
+                tracing::warn!(route = %route.name, bytes = body.len(), compressed, fail_mode = ?route.fail_mode, "request body could not be inspected");
+                if route.fail_mode == FailMode::Closed && !route.shadow {
+                    return Ok(json_error(
+                        StatusCode::FORBIDDEN,
+                        "promptwall_uninspectable",
+                        "Request blocked by Promptwall: the body could not be inspected",
+                        &[],
+                    ));
+                }
+                return Ok(self.forward(with_body(parts, body), None).await);
+            }
+        };
+
+        let Some(action) = outcome.action else {
+            return Ok(self.forward(with_body(parts, body), None).await);
+        };
+        let kinds: Vec<String> = outcome.findings.keys().map(|k| k.id()).collect();
+        tracing::info!(
+            route = %route.name,
+            action = action.as_str(),
+            shadow = route.shadow,
+            findings = ?outcome.findings.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>(),
+            "sensitive data in request"
+        );
+        if route.shadow {
+            return Ok(self.forward(with_body(parts, body), None).await);
+        }
+        match action {
+            Action::Block => Ok(json_error(
+                StatusCode::FORBIDDEN,
+                "promptwall_policy_violation",
+                &format!("Request blocked by Promptwall policy: {}", kinds.join(", ")),
+                &kinds,
+            )),
+            Action::Redact => {
+                let body = outcome.redacted_body.unwrap_or(body);
+                Ok(self.forward(with_body(parts, body), Some(action)).await)
+            }
+            Action::Flag => Ok(self.forward(with_body(parts, body), Some(action)).await),
+        }
+    }
+
+    async fn forward(
+        &self,
+        req: Request<ProxyBody>,
+        action: Option<Action>,
+    ) -> Response<ProxyBody> {
+        match self.inner.client.request(req).await {
             Ok(resp) => {
                 let (mut parts, body) = resp.into_parts();
                 strip_hop_by_hop(&mut parts.headers);
-                Ok(Response::from_parts(parts, body.boxed()))
+                if let Some(action) = action {
+                    parts
+                        .headers
+                        .insert(ACTION_HEADER, HeaderValue::from_static(action.as_str()));
+                }
+                Response::from_parts(parts, body.boxed())
             }
             Err(err) => {
                 tracing::warn!(error = %err, "upstream request failed");
-                Ok(text(StatusCode::BAD_GATEWAY, "upstream unavailable\n"))
+                text(StatusCode::BAD_GATEWAY, "upstream unavailable\n")
             }
         }
     }
@@ -193,12 +288,44 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn text(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
-    let mut resp = Response::new(
-        Full::new(Bytes::from_static(body.as_bytes()))
-            .map_err(|e| match e {})
-            .boxed(),
+/// Rebuilds a request around a body that was read into memory.
+fn with_body(mut parts: http::request::Parts, body: Bytes) -> Request<ProxyBody> {
+    parts.headers.remove(header::TRANSFER_ENCODING);
+    parts
+        .headers
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+    Request::from_parts(parts, full(body))
+}
+
+fn full(body: Bytes) -> ProxyBody {
+    Full::new(body).map_err(|e| match e {}).boxed()
+}
+
+/// An error in the OpenAI error shape, so existing clients surface the message.
+fn json_error(
+    status: StatusCode,
+    kind: &str,
+    message: &str,
+    findings: &[String],
+) -> Response<ProxyBody> {
+    let body = serde_json::json!({
+        "error": { "message": message, "type": kind, "code": status.as_u16(), "findings": findings }
+    });
+    let mut resp = Response::new(full(body.to_string().into()));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
     );
+    if status == StatusCode::FORBIDDEN {
+        resp.headers_mut()
+            .insert(ACTION_HEADER, HeaderValue::from_static("block"));
+    }
+    resp
+}
+
+fn text(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
+    let mut resp = Response::new(full(Bytes::from_static(body.as_bytes())));
     *resp.status_mut() = status;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,

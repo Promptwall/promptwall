@@ -2,7 +2,7 @@
 
 **An open source AI firewall.** Promptwall sits between your application and any LLM and blocks prompt injection, jailbreaks and data leaks in both directions, while adding only single-digit milliseconds of latency.
 
-> **Status: early Phase 1.** Promptwall currently runs as a transparent pass-through proxy with a latency benchmark. No detectors are active yet, so it does not block anything.
+> **Status: early Phase 1.** Promptwall routes requests by a YAML policy and can block secrets and redact personal data in prompts (pattern-based, Tier 1). Prompt-injection detection and response inspection are not built yet.
 
 ## Goals
 
@@ -22,18 +22,28 @@ cargo run --release -p promptwall -- --listen 127.0.0.1:8080 --upstream https://
 
 Then point your OpenAI client at `http://127.0.0.1:8080/v1`. Requests and streamed responses pass through unchanged; `GET /healthz` answers locally.
 
+To inspect requests, start it with a policy instead:
+
+```sh
+cargo run --release -p promptwall -- --policy examples/policy.yaml
+```
+
+With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, and emails, IBANs and card numbers are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
+
 To measure the latency the proxy adds:
 
 ```sh
 scripts/bench.sh                 # non-streamed, 2,000-token prompts, 200 req/s
 scripts/bench.sh --stream        # streamed responses
+BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 ```
 
 ## Repository layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/proxy` | The `promptwall` data plane (library and binary) |
+| `crates/proxy` | The `promptwall` data plane (library and binary): routing, policy, inspection |
+| `crates/detect` | Tier 1 detectors for PII and secrets; no I/O, so it can also build for WebAssembly |
 | `crates/mock-upstream` | Mock OpenAI-compatible upstream used by tests and benchmarks |
 | `crates/bench` | `pw-bench`, the latency benchmark |
 

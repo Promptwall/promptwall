@@ -76,6 +76,8 @@ async fn handle(
     let echo = req.headers().get("x-echo").cloned();
     // Lets tests check that hop-by-hop headers were not forwarded.
     let saw_hop = req.headers().contains_key("x-hop");
+    // Lets tests see exactly what the upstream received.
+    let echo_body = req.headers().contains_key("x-echo-body");
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => Bytes::new(),
@@ -84,7 +86,9 @@ async fn handle(
 
     tokio::time::sleep(config.delay).await;
 
-    let mut resp = if stream {
+    let mut resp = if echo_body {
+        Response::new(Full::new(body.clone()).boxed())
+    } else if stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
         tokio::spawn(async move {
             for i in 0..config.chunks {

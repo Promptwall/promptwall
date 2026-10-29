@@ -1,0 +1,12 @@
+# Policy used by scripts/bench.sh to measure the cost of Tier 1 detection.
+version: 1
+upstreams:
+  mock: { url: "http://127.0.0.1:9000" }
+routes:
+  - name: bench
+    upstream: mock
+    input:
+      - detector: secrets
+        action: block
+      - detector: pii
+        action: redact

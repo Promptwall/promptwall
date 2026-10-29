@@ -35,6 +35,7 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 ## Known limits
 
 - No detector catches every injection. Promptwall reduces risk and gives visibility; it is one layer, not a guarantee. Docs must say this plainly.
+- Pattern-based PII detection finds structured data (emails, international phone numbers, IBANs, card numbers). It does not find names, addresses or national phone formats; those need the ML tier.
 - Encodings and languages: MVP normalizes Unicode, invisible characters and base64; non-English coverage is best-effort until the multilingual model ships.
 - Content a provider sees before the firewall decides (optimistic forwarding) is never released to the user if a check fails, but it has been sent upstream. Routes handling sensitive data must disable optimistic forwarding.
 - The firewall itself handles sensitive data. It stores no prompt content unless logging is explicitly enabled, and redacts before logging.
