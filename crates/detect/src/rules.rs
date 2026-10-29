@@ -186,6 +186,96 @@ pub(crate) const RULES: &[Spec] = &[
         r#"(?i)\b(?:password|passwd|passwort|pwd|secret|client_secret|api[_-]?key|access[_-]?token|auth[_-]?token)["']?\s*[:=]\s*["']?([^\s"',;]{6,})"#,
         valid_secret_value,
     ),
+    // Prompt injection. These run only on text the end user or a tool supplied,
+    // not on the app's own system prompt (see the proxy's inspect module). They
+    // look for the attack phrasing, so a request that merely talks about
+    // "instructions" does not match. English, German, French, Spanish, Italian
+    // and Dutch.
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignore|disregard|forget|override|bypass)\s+(?:(?:all|any|every|each|the|of|your|these|those|its|everything|previously|given)\s+){0,4}(?:previous|prior|preceding|above|earlier|former|foregoing|initial|original|system|developer|safety)\s+(?:(?:and|or|safety|system|given|stated)\s+){0,2}(?:instructions?|prompts?|rules|directions|directives|guidelines|guardrails|restrictions|constraints|commands|programming)\b",
+        accept,
+    ),
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignore|disregard|forget)\s+(?:all|everything)\s+(?:that\s+)?(?:above|before|you\s+(?:were|have\s+been)\s+(?:told|given|instructed))\b",
+        accept,
+    ),
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignorier\w*|vergiss|vergessen\s+sie|missacht\w*)\s+(?:\S+\s+){0,2}?(?:alle|vorherigen|vorigen|bisherigen|obigen|früheren|ursprünglichen|deine|ihre)\s+(?:\S+\s+)?(?:anweisungen|instruktionen|befehle|regeln|vorgaben|systemanweisungen)\b",
+        accept,
+    ),
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignore[rz]?|oublie[rz]?)\s+(?:(?:toutes\s+)?les\s+(?:instructions|consignes|règles|directives)\s+(?:précédentes|antérieures|ci-dessus|initiales|du\s+système)|(?:toutes\s+)?(?:tes|vos)\s+(?:instructions|consignes|règles|directives))",
+        accept,
+    ),
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignora|ignore|olvida|olvide|omite)\s+(?:(?:todas\s+)?las\s+(?:instrucciones|reglas|indicaciones|directrices)\s+(?:anteriores|previas|iniciales|del\s+sistema)|(?:todas\s+)?(?:tus|sus)\s+(?:instrucciones|reglas|indicaciones|directrices))\b",
+        accept,
+    ),
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:ignora|dimentica)\s+(?:(?:tutte\s+)?le\s+(?:istruzioni|regole|indicazioni)\s+(?:precedenti|iniziali|del\s+sistema)|(?:tutte\s+)?le\s+tue\s+(?:istruzioni|regole))\b",
+        accept,
+    ),
+    rule(
+        Kind::IgnorePrevious,
+        r"(?i)\b(?:negeer|vergeet)\s+(?:alle\s+)?(?:(?:de\s+)?(?:vorige|eerdere|voorgaande|bovenstaande)\s+|(?:je|jouw|uw)\s+)(?:instructies|regels|opdrachten)\b",
+        accept,
+    ),
+    rule(
+        Kind::RoleOverride,
+        r"(?i)\b(?:you\s+are\s+now|from\s+now\s+on,?\s+you\s+(?:are|will\s+be|will\s+act\s+as)|act\s+as|pretend\s+(?:to\s+be|you\s+are)|roleplay\s+as)\s+(?:(?:a|an|the|my|completely|totally|fully)\s+){0,3}(?:(?-i:DAN)|jailbroken|unrestricted|unfiltered|uncensored|unaligned)\b",
+        accept,
+    ),
+    rule(
+        Kind::RoleOverride,
+        r"(?i)\b(?:(?:developer|god|jailbreak|(?-i:DAN)|unrestricted)\s+mode\s+(?:is\s+)?(?:enabled|activated|on)|(?:enable|activate|enter)\s+(?:developer|god|jailbreak|(?-i:DAN))\s+mode|do\s+anything\s+now)\b",
+        accept,
+    ),
+    rule(
+        Kind::RoleOverride,
+        r"(?i)\b(?:without|ignoring|free\s+(?:of|from)|no\s+longer\s+bound\s+by)\s+(?:(?:any|all|your|the)\s+)*(?:(?:ethical|moral|content|safety|openai|anthropic)\s+)+(?:guidelines|restrictions|filters|limitations|policies|rules|constraints)\b",
+        accept,
+    ),
+    rule(
+        Kind::RoleOverride,
+        r"(?i)\b(?:du\s+bist\s+(?:jetzt|ab\s+sofort|nun)|ab\s+sofort\s+bist\s+du)\s+(?:(?:ein|eine|ganz|völlig)\s+){0,2}(?:(?-i:DAN)|uneingeschränkt\w*|unzensiert\w*|ohne\s+(?:jegliche\s+)?(?:einschränkungen|regeln|filter))|\bentwicklermodus\s+(?:ist\s+)?(?:aktiviert|an)\b",
+        accept,
+    ),
+    rule(
+        Kind::PromptExtraction,
+        r"(?i)\b(?:reveal|show|print|display|output|repeat|tell|give|leak|dump|share|write\s+out|spell\s+out)\s+(?:me\s+|us\s+)?(?:(?:what|is|are|all|of|word\s+for\s+word|verbatim)\s+){0,3}(?:your|the)\s+(?:(?:full|entire|exact|complete|original|initial|hidden|secret|first)\s+)*(?:system|initial|hidden|original|developer|secret|pre-?prompt)\s+(?:prompt|instructions|message|rules)\b",
+        accept,
+    ),
+    rule(
+        Kind::PromptExtraction,
+        r"(?i)\b(?:what\s+(?:is|are|was|were)\s+your\s+(?:system|initial|original|hidden)\s+(?:prompt|instructions)|repeat\s+(?:\S+\s+){0,3}?(?:words|text|everything|instructions)\s+(?:above|before\s+this))\b",
+        accept,
+    ),
+    rule(
+        Kind::PromptExtraction,
+        r"(?i)\b(?:zeig|gib|nenne|wiederhole|verrate)\w*\s+(?:mir\s+|uns\s+)?(?:\S+\s+){0,2}?(?:deinen|deine|ihren|ihre|den|die)\s+(?:system-?prompt|systemanweisungen|ursprünglichen\s+anweisungen|versteckten\s+anweisungen)",
+        accept,
+    ),
+    // Special tokens of common chat templates: user text that contains them is
+    // trying to forge a system or assistant turn.
+    rule(
+        Kind::ChatTemplate,
+        r"<\|(?:im_start|im_end|system|user|assistant|endoftext|start_header_id|end_header_id|eot_id|begin_of_text)\|>|\[/?INST\]|<</?SYS>>|<(?:start|end)_of_turn>",
+        accept,
+    ),
+    // Text a person cannot see but a model reads: Unicode tag characters
+    // ("ASCII smuggling"), bidi overrides, runs of zero-width characters, and
+    // runs of variation selectors used to hide bytes after an emoji.
+    rule(
+        Kind::HiddenText,
+        r"[\x{E0000}-\x{E007F}]{2,}|[\x{202D}\x{202E}]|[\x{200B}-\x{200D}\x{2060}\x{FEFF}]{3,}|[\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}]{4,}",
+        accept,
+    ),
 ];
 
 fn accept(s: &str) -> Option<usize> {

@@ -24,6 +24,17 @@ struct Args {
     /// every request is forwarded to --upstream uninspected.
     #[arg(long, env = "PROMPTWALL_POLICY", conflicts_with = "upstream")]
     policy: Option<PathBuf>,
+
+    /// Directory with an ONNX prompt-injection classifier (model.onnx,
+    /// tokenizer.json, config.json). Without one, the prompt_injection detector
+    /// uses its Tier 1 patterns only.
+    #[arg(long, env = "PROMPTWALL_INJECTION_MODEL")]
+    injection_model: Option<PathBuf>,
+
+    /// Classifier sessions that run in parallel (each holds a copy of the model).
+    /// Defaults to the number of CPUs, at most 4.
+    #[arg(long, env = "PROMPTWALL_MODEL_SESSIONS")]
+    model_sessions: Option<usize>,
 }
 
 #[tokio::main]
@@ -39,7 +50,20 @@ async fn main() -> anyhow::Result<()> {
     };
     let routes: Vec<&str> = policy.routes.iter().map(|r| r.name.as_str()).collect();
     tracing::info!(?routes, policy = ?args.policy, "policy loaded");
-    let proxy = promptwall::Proxy::with_policy(policy)?;
+    let classifier = match &args.injection_model {
+        Some(dir) => {
+            let mut options = promptwall_classify::Options::default();
+            if let Some(n) = args.model_sessions {
+                options.sessions = n;
+            }
+            let started = std::time::Instant::now();
+            let model = promptwall_classify::Classifier::load(dir, &options)?;
+            tracing::info!(model = %dir.display(), sessions = options.sessions, load_ms = started.elapsed().as_millis() as u64, "injection classifier loaded");
+            Some(std::sync::Arc::new(model))
+        }
+        None => None,
+    };
+    let proxy = promptwall::Proxy::with_classifier(policy, classifier)?;
     let (listener, addr) = promptwall::bind(args.listen).await?;
     tracing::info!(%addr, "promptwall listening");
 

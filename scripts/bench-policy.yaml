@@ -6,6 +6,8 @@ routes:
   - name: bench
     upstream: mock
     input:
+      - detector: prompt_injection
+        action: block
       - detector: secrets
         action: block
       - detector: pii

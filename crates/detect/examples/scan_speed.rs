@@ -17,7 +17,9 @@ fn main() {
             clean.push(' ');
         }
         let dirty = format!("{clean} contact jane@example.com, IBAN DE89 3704 0044 0532 0130 00");
-        for (label, text) in [("clean", &clean), ("with PII", &dirty)] {
+        // Non-ASCII text takes the slower Unicode paths of the injection rules.
+        let german = "Grüße für Jürgen über die Änderungen ".repeat(tokens / 6);
+        for (label, text) in [("clean", &clean), ("with PII", &dirty), ("German", &german)] {
             let runs = 200;
             let start = Instant::now();
             let mut found = 0;

@@ -1,0 +1,7 @@
+{
+  "id2label": {
+    "0": "SAFE",
+    "1": "INJECTION"
+  },
+  "max_position_embeddings": 16
+}

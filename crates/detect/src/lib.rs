@@ -1,4 +1,4 @@
-//! Tier 1 detectors: pattern-based PII and secret detection.
+//! Tier 1 detectors: pattern-based PII, secret and prompt-injection detection.
 //!
 //! Every detector is a regular expression plus a validator (a checksum, a
 //! valid range) that removes false positives, and for generic formats a
@@ -56,6 +56,14 @@ pub enum Kind {
     Jwt,
     UrlCredentials,
     Password,
+    IgnorePrevious,
+    RoleOverride,
+    PromptExtraction,
+    ChatTemplate,
+    HiddenText,
+    /// Verdict of the Tier 2 injection classifier. This crate never reports it;
+    /// it exists so policies can name it next to the pattern-based kinds.
+    InjectionClassifier,
     /// A pattern or keyword list defined in a policy.
     Custom(u16),
 }
@@ -65,12 +73,13 @@ pub enum Kind {
 pub enum Category {
     Pii,
     Secret,
+    Injection,
     Custom,
 }
 
 impl Kind {
     /// All built-in kinds.
-    pub const ALL: [Kind; 32] = [
+    pub const ALL: [Kind; 38] = [
         Kind::Email,
         Kind::Phone,
         Kind::Iban,
@@ -103,6 +112,12 @@ impl Kind {
         Kind::Jwt,
         Kind::UrlCredentials,
         Kind::Password,
+        Kind::IgnorePrevious,
+        Kind::RoleOverride,
+        Kind::PromptExtraction,
+        Kind::ChatTemplate,
+        Kind::HiddenText,
+        Kind::InjectionClassifier,
     ];
 
     pub fn category(self) -> Category {
@@ -122,6 +137,12 @@ impl Kind {
             | Kind::UkNino
             | Kind::UsSsn
             | Kind::IpAddress => Category::Pii,
+            Kind::IgnorePrevious
+            | Kind::RoleOverride
+            | Kind::PromptExtraction
+            | Kind::ChatTemplate
+            | Kind::HiddenText
+            | Kind::InjectionClassifier => Category::Injection,
             Kind::Custom(_) => Category::Custom,
             _ => Category::Secret,
         }
@@ -163,6 +184,12 @@ impl Kind {
             Kind::Jwt => "jwt",
             Kind::UrlCredentials => "url_credentials",
             Kind::Password => "password",
+            Kind::IgnorePrevious => "ignore_previous",
+            Kind::RoleOverride => "role_override",
+            Kind::PromptExtraction => "prompt_extraction",
+            Kind::ChatTemplate => "chat_template",
+            Kind::HiddenText => "hidden_text",
+            Kind::InjectionClassifier => "classifier",
             Kind::Custom(_) => "custom",
         }
     }
@@ -172,6 +199,7 @@ impl Kind {
         let prefix = match self.category() {
             Category::Pii => "pii",
             Category::Secret => "secret",
+            Category::Injection => "injection",
             Category::Custom => "custom",
         };
         format!("{prefix}.{}", self.entity())

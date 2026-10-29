@@ -34,7 +34,7 @@ flowchart LR
 | --- | --- | --- |
 | Data plane | Rust (Tokio, Hyper; evaluate Pingora) | Predictable latency, no GC pauses, memory safety, one static binary |
 | Pattern matching | Vectorscan/Hyperscan, Rust `regex` sets, Aho-Corasick | Thousands of patterns in one pass |
-| ML inference | ONNX Runtime, INT8-quantized models under 100M parameters | 5 to 15 ms on CPU, no GPU required |
+| ML inference | ONNX Runtime, INT8-quantized models under 100M parameters | 12 to 200 ms on CPU today, run in parallel with the provider call ([models](models.md)); under 10 ms is the goal for an in-house distilled model |
 | Plugins | WebAssembly (Wasmtime) | Sandboxed, language-agnostic |
 | Policy language | YAML plus CEL expressions | Readable and testable |
 | npm package | Tier 1 detectors compiled to WebAssembly | Same rules in Node and edge runtimes |
@@ -50,9 +50,11 @@ Added by the firewall, prompts up to 2,000 tokens:
 | --- | --- | --- |
 | Proxy overhead (TLS, parse, normalize) | 1 ms | 2 ms |
 | Tier 1 fast checks | 0.5 ms | 1 ms |
-| Tier 2 ML classifiers (parallel) | 6 ms | 15 ms |
+| Tier 2 ML classifiers (parallel with the provider call, see below) | 0 ms added | 0 ms added |
 | Policy decision and redaction | 0.5 ms | 1 ms |
 | **Total** | **about 8 ms** | **under 20 ms** |
+
+Tier 2 classifiers do not fit the budget on the request path: open models take 12 to 200 ms on CPU depending on prompt length. They therefore run while the request is already with the provider, and only the response waits for their verdict; a block cancels the provider call. Providers take hundreds of milliseconds to the first token, so the classifier usually adds nothing. Routes can opt out with `parallel: false` ([models](models.md)).
 
 How it stays there: parallel detectors with per-detector timeouts, verdict caching for repeated system prompts and documents, scanning only new turns in a conversation, chunked inspection of streamed output, and shadow (async) mode for any detector that misses its budget. The [benchmark spec](specs/benchmark.md) defines how these numbers are measured and enforced in CI.
 
