@@ -6,6 +6,7 @@
 //! Responses are always streamed back without buffering.
 
 pub mod inspect;
+pub mod limits;
 pub mod moderation;
 pub mod ner;
 pub mod output;
@@ -198,6 +199,20 @@ impl Proxy {
         };
 
         let (mut parts, body) = req.into_parts();
+        if let Some(limiter) = &route.limits {
+            match limiter.admit(&parts.headers, limits::now()) {
+                Ok(ticket) if limiter.counts_tokens() => {
+                    parts.extensions.insert(Arc::new(ticket));
+                }
+                Ok(_) => {}
+                Err(over) => {
+                    tracing::info!(route = %route.name, limit = over.what, max = over.limit, shadow = route.shadow, "rate limit reached");
+                    if !route.shadow {
+                        return Ok(rate_limited(&over));
+                    }
+                }
+            }
+        }
         let path = parts
             .uri
             .path_and_query()
@@ -445,6 +460,20 @@ impl Proxy {
         action: Option<Action>,
     ) -> Response<ProxyBody> {
         let check = req.extensions().get::<Arc<output::OutputCheck>>().cloned();
+        let ticket = req.extensions().get::<Arc<limits::Ticket>>().cloned();
+        let resp = self.send(req, action, check).await;
+        match ticket {
+            Some(ticket) => resp.map(|body| limits::meter(body, ticket)),
+            None => resp,
+        }
+    }
+
+    async fn send(
+        &self,
+        req: Request<ProxyBody>,
+        action: Option<Action>,
+        check: Option<Arc<output::OutputCheck>>,
+    ) -> Response<ProxyBody> {
         match self.inner.client.request(req).await {
             Ok(resp) => {
                 let (mut parts, body) = resp.into_parts();
@@ -824,6 +853,21 @@ fn policy_violation(outcome: &inspect::Outcome) -> Response<ProxyBody> {
         &format!("Request blocked by Promptwall policy: {}", kinds.join(", ")),
         &kinds,
     )
+}
+
+fn rate_limited(over: &limits::Exceeded) -> Response<ProxyBody> {
+    let mut resp = json_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "promptwall_rate_limited",
+        &format!(
+            "Rate limit reached: {} {}. Try again in {} seconds.",
+            over.limit, over.what, over.retry_after
+        ),
+        &[],
+    );
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(over.retry_after));
+    resp
 }
 
 fn uninspectable() -> Response<ProxyBody> {

@@ -15,6 +15,7 @@ use http::Uri;
 use promptwall_detect::{Category, Detector, Kind};
 use serde::Deserialize;
 
+use crate::limits::{LimitKey, Limiter, Limits};
 use crate::tools::{ArgumentRule, ToolRules};
 
 /// What happens when a detector finds something. Ordered by severity.
@@ -138,6 +139,8 @@ pub struct Route {
     pub topics: Option<TopicRule>,
     /// Names, addresses and other entities in the request (Tier 2 PII model).
     pub pii: Option<Arc<PiiRule>>,
+    /// Rate and token limits, with their counters.
+    pub limits: Option<Arc<Limiter>>,
 }
 
 /// The `pii` entities that a Tier 2 token-classification model finds.
@@ -289,6 +292,7 @@ impl Policy {
                 safety: None,
                 topics: None,
                 pii: None,
+                limits: None,
             }],
             tests: Vec::new(),
         })
@@ -347,6 +351,12 @@ impl Policy {
                 ..
             } = compile_detectors(&spec.input, Side::Input)
                 .with_context(|| format!("route {name:?} input"))?;
+            let limits = spec
+                .limits
+                .map(compile_limits)
+                .transpose()
+                .with_context(|| format!("route {name:?} limits"))?
+                .map(|l| Arc::new(Limiter::new(l)));
             let tools = spec
                 .tools
                 .map(compile_tools)
@@ -405,6 +415,7 @@ impl Policy {
                 safety,
                 topics,
                 pii,
+                limits,
                 name,
             });
         }
@@ -804,6 +815,51 @@ struct RouteFile {
     output: Vec<DetectorFile>,
     stream_holdback: Option<usize>,
     tools: Option<ToolsFile>,
+    limits: Option<LimitsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    /// `route` (default), `api_key` or `header:<name>`.
+    key: Option<String>,
+    requests_per_minute: Option<u64>,
+    requests_per_day: Option<u64>,
+    tokens_per_minute: Option<u64>,
+    tokens_per_day: Option<u64>,
+}
+
+fn compile_limits(spec: LimitsFile) -> anyhow::Result<Limits> {
+    let key = match spec.key.as_deref().map(str::trim) {
+        None | Some("route") => LimitKey::Route,
+        Some("api_key") => LimitKey::ApiKey,
+        Some(other) => match other.strip_prefix("header:") {
+            Some(name) => LimitKey::Header(
+                HeaderName::try_from(name.trim().to_ascii_lowercase())
+                    .with_context(|| format!("invalid header name {name:?}"))?,
+            ),
+            None => bail!("key must be route, api_key or header:<name>, not {other:?}"),
+        },
+    };
+    let limits = Limits {
+        key,
+        requests_per_minute: spec.requests_per_minute,
+        requests_per_day: spec.requests_per_day,
+        tokens_per_minute: spec.tokens_per_minute,
+        tokens_per_day: spec.tokens_per_day,
+    };
+    let all = [
+        limits.requests_per_minute,
+        limits.requests_per_day,
+        limits.tokens_per_minute,
+        limits.tokens_per_day,
+    ];
+    ensure!(all.iter().any(Option::is_some), "set at least one limit");
+    ensure!(
+        all.iter().flatten().all(|&n| n > 0),
+        "limits must be above 0"
+    );
+    Ok(limits)
 }
 
 #[derive(Deserialize)]
@@ -1011,7 +1067,7 @@ routes:
         .contains("unknown entity \"ssn\""));
         // A field from the spec that this version does not support yet.
         assert!(err(&format!(
-            "{base}routes: [{{ name: r, upstream: a, limits: {{}} }}]"
+            "{base}routes: [{{ name: r, upstream: a, rules: [] }}]"
         ))
         .contains("unknown field"));
         assert!(err("version: 2\nupstreams: {}\nroutes: []").contains("unsupported policy version"));
