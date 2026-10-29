@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::signing::{self, PublicKey};
 use crate::{metrics, Policy, Proxy};
 
 /// What a check of the policy file did.
@@ -25,33 +26,48 @@ pub enum Reload {
 #[derive(Debug)]
 pub struct Watcher {
     path: PathBuf,
+    key: Option<PublicKey>,
     /// Hash of the content last seen, loaded or not.
     seen: Option<u64>,
 }
 
 impl Watcher {
-    /// A watcher for `path`, which the proxy has already loaded.
-    pub fn new(path: &Path) -> Self {
-        Self {
+    /// A watcher for `path`, which the proxy has already loaded. With a
+    /// key, changed files are only used if their signature is valid.
+    pub fn new(path: &Path, key: Option<PublicKey>) -> Self {
+        let mut watcher = Self {
             path: path.to_owned(),
-            seen: std::fs::read(path).ok().map(|c| hash(&c)),
+            key,
+            seen: None,
+        };
+        watcher.seen = watcher.state();
+        watcher
+    }
+
+    /// A hash of the policy file and, with signing on, its signature.
+    fn state(&self) -> Option<u64> {
+        let content = std::fs::read(&self.path).ok()?;
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        if self.key.is_some() {
+            std::fs::read(signing::signature_path(&self.path))
+                .ok()
+                .hash(&mut hasher);
         }
+        Some(hasher.finish())
     }
 
     /// Reloads the policy into `proxy` if the file changed since the last check.
     pub fn check(&mut self, proxy: &Proxy) -> Reload {
-        let Ok(content) = std::fs::read(&self.path) else {
+        let Some(state) = self.state() else {
             // Missing for a moment while an editor or ConfigMap swaps it.
             return Reload::Unchanged;
         };
-        let h = hash(&content);
-        if self.seen == Some(h) {
+        if self.seen == Some(state) {
             return Reload::Unchanged;
         }
-        self.seen = Some(h);
-        let loaded = std::str::from_utf8(&content)
-            .map_err(anyhow::Error::from)
-            .and_then(Policy::from_yaml)
+        self.seen = Some(state);
+        let loaded = Policy::load_signed(&self.path, self.key.as_ref())
             .and_then(|policy| proxy.reload(policy));
         let result = if loaded.is_ok() { "ok" } else { "error" };
         metrics::count("promptwall_policy_reloads_total", &[("result", result)], 1);
@@ -63,8 +79,8 @@ impl Watcher {
 }
 
 /// Checks the policy file every `interval`, forever, and logs what changed.
-pub async fn watch(proxy: Proxy, path: PathBuf, interval: Duration) {
-    let mut watcher = Watcher::new(&path);
+pub async fn watch(proxy: Proxy, path: PathBuf, key: Option<PublicKey>, interval: Duration) {
+    let mut watcher = Watcher::new(&path, key);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -87,10 +103,4 @@ pub async fn watch(proxy: Proxy, path: PathBuf, interval: Duration) {
             ),
         }
     }
-}
-
-fn hash(content: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
 }

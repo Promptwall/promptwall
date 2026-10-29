@@ -1,6 +1,6 @@
 # Policy format
 
-**Status:** draft, partly implemented. Field names may change before Phase 1 ships; after the first release the format is versioned and backwards compatible within a major version.
+**Status:** version 1, stable. Everything under "Implemented today" keeps working in every release that reads `version: 1`; see [Stability](#stability). The [JSON Schema](policy-v1.schema.json) (also printed by `promptwall schema`) describes every field, for editor autocompletion and for tools that generate policies.
 
 ## Implemented today
 
@@ -19,7 +19,7 @@
 | `except` on `pii`, `secrets`, `custom`, `prompt_injection` and `exfiltration` entries; `action: allow` | Yes |
 | `tests` (`route`, `input` or `output`, `expect`), `promptwall validate`, `test` and `scan` | Yes |
 | `routes[].limits` with `key`, `requests_per_minute`, `requests_per_day`, `tokens_per_minute`, `tokens_per_day` | Yes |
-| `mode: indirect`, `untrusted_content`, `rules`, `action: rewrite` | Not yet |
+| `mode: indirect`, `untrusted_content`, `rules`, `action: rewrite` | Planned, as additions to version 1 |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
 
@@ -270,11 +270,11 @@ routes:
 | `defaults` | Values every route inherits unless it overrides them. |
 | `upstreams` | Named LLM endpoints the firewall forwards to. |
 | `routes[].match` | Path, header or API key conditions selecting the traffic. First match wins. |
-| `input`, `output`, `untrusted_content` | Detectors run on the prompt, the response (including streams), and on content marked as retrieved. |
+| `input`, `output`, `untrusted_content` | Detectors run on the prompt, the response (including streams), and on content marked as retrieved (`untrusted_content`: planned). |
 | `detector` | Built-in detector ID or a plugin ID (`plugin:<name>`). |
 | `threshold` | Score from 0 to 1 above which an ML detector fires. |
-| `action` | `allow`, `block`, `redact`, `rewrite` or `flag`. |
-| `rules` | Custom rules written as [CEL](https://cel.dev) expressions over detections and request metadata. |
+| `action` | `allow`, `block`, `redact` or `flag` (`rewrite`: planned). |
+| `rules` | Planned: custom rules written as [CEL](https://cel.dev) expressions over detections and request metadata. |
 | `limits` | Rate and token limits per route; can also be keyed per user or API key. |
 
 ## Rule IDs and ownership
@@ -327,6 +327,19 @@ promptwall scan --policy policy.yaml --route support-bot "text to check"   # --o
 ```
 
 The model flags (`--pii-model` and the others) work with every command. `examples/policy.yaml` has tests, and CI runs them.
+
+## Stability
+
+Version 1 is frozen. Within `version: 1`:
+
+- No field, value or detector is removed or renamed, and none changes meaning. A file that loads today loads in every later 1.x release and does the same; [`tests/fixtures/policy-v1-full.yaml`](../../crates/proxy/tests/fixtures/policy-v1-full.yaml) uses every field and CI loads it on every change.
+- New features arrive as new optional fields or values, such as `action: rewrite` or `rules`. An older proxy rejects a file that uses them (unknown fields are errors), so a new rule never silently does nothing; with reload, the policy in force stays.
+- Detectors may find more over time (new patterns, better models). That is a fix, not a format change: pin the release if you need identical findings, and keep `tests:` in the policy to see what changed.
+- Finding labels (`pii.email`, `injection.ignore_previous`) are part of the format: they stay as they are, so dashboards, alerts and `except` entries keep working.
+
+A change that breaks any of this needs `version: 2`, and the proxy would read both versions for at least one major release.
+
+To check a policy in an editor, point it at the schema, for example with the first line `# yaml-language-server: $schema=https://raw.githubusercontent.com/Promptwall/promptwall/main/docs/specs/policy-v1.schema.json` in VS Code with the YAML extension.
 
 ## Open questions
 

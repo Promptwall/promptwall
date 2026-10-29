@@ -1,0 +1,547 @@
+{
+  "$id": "https://github.com/Promptwall/promptwall/blob/main/docs/specs/policy-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Promptwall policy, version 1",
+  "type": "object",
+  "properties": {
+    "version": {
+      "description": "Format version. Only 1 exists.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1,
+      "maximum": 1
+    },
+    "defaults": {
+      "description": "Settings every route has unless it sets its own.",
+      "$ref": "#/$defs/DefaultsFile"
+    },
+    "upstreams": {
+      "description": "LLM providers by name, such as `openai`.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/UpstreamFile"
+      }
+    },
+    "routes": {
+      "description": "Matched in order; the first route whose `match` fits a request applies.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RouteFile"
+      }
+    },
+    "tests": {
+      "description": "Sample prompts and answers with what the policy must do with them,\nrun by `promptwall test`.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TestFile"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "upstreams",
+    "routes"
+  ],
+  "$defs": {
+    "DefaultsFile": {
+      "type": "object",
+      "properties": {
+        "fail_mode": {
+          "description": "What happens to traffic that cannot be inspected: `open` forwards it\n(default), `closed` rejects it.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shadow": {
+          "description": "Only log what would be blocked or redacted; change nothing.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "FailMode": {
+      "description": "What happens when a request cannot be inspected (too large, compressed, not text).",
+      "oneOf": [
+        {
+          "description": "Forward it uninspected and log a warning.",
+          "type": "string",
+          "const": "open"
+        },
+        {
+          "description": "Reject it.",
+          "type": "string",
+          "const": "closed"
+        }
+      ]
+    },
+    "UpstreamFile": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "description": "Scheme and host, such as `https://api.openai.com`, without a path.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "url"
+      ]
+    },
+    "RouteFile": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Shown in logs, metrics and the decision log.",
+          "type": "string"
+        },
+        "match": {
+          "description": "Which requests the route applies to; without it, all of them.",
+          "$ref": "#/$defs/MatchFile"
+        },
+        "upstream": {
+          "description": "The name of an entry under `upstreams`.",
+          "type": "string"
+        },
+        "fail_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shadow": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "input": {
+          "description": "Checks on the request. For an entity, the first entry that names it wins.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DetectorFile"
+          }
+        },
+        "output": {
+          "description": "Checks on the model's answer, including streamed answers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DetectorFile"
+          }
+        },
+        "stream_holdback": {
+          "description": "Characters of a streamed answer held back so that a finding split\nacross chunks is caught.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "tools": {
+          "description": "Tools the model may use, and limits on their arguments.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolsFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "limits": {
+          "description": "Rate and token limits.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LimitsFile"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "upstream"
+      ]
+    },
+    "MatchFile": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Path prefix, such as `/v1/messages`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header": {
+          "description": "Headers that must have exactly these values.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "DetectorFile": {
+      "type": "object",
+      "properties": {
+        "detector": {
+          "$ref": "#/$defs/DetectorName"
+        },
+        "entities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "name": {
+          "description": "Custom detectors only: the name used in logs and redaction markers.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "description": "Custom detectors only: a regular expression.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keywords": {
+          "description": "Custom detectors only: case-insensitive words or phrases.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "threshold": {
+          "description": "prompt_injection only: classifier score from 0 to 1 at which it fires.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float"
+        },
+        "parallel": {
+          "description": "prompt_injection only: run the classifier while the request is forwarded\n(default) or before.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow_domains": {
+          "description": "exfiltration only: domains that links and images may point to.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "min_words": {
+          "description": "system_prompt_leak only: words in a row that count as a leak.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "deny": {
+          "description": "topics only: topics that are not allowed.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "allow": {
+          "description": "topics only: the topics a request must be about.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "except": {
+          "description": "Values that are not findings, such as the company's own support address.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "action": {
+          "$ref": "#/$defs/RuleAction"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "detector",
+        "action"
+      ]
+    },
+    "DetectorName": {
+      "type": "string",
+      "enum": [
+        "pii",
+        "secrets",
+        "prompt_injection",
+        "exfiltration",
+        "system_prompt_leak",
+        "custom",
+        "content_safety",
+        "topics"
+      ]
+    },
+    "RuleAction": {
+      "description": "The action of a detector entry: an [`Action`], or `allow`, which exempts\nthe entry's entities from later entries.",
+      "type": "string",
+      "enum": [
+        "allow",
+        "flag",
+        "redact",
+        "block"
+      ]
+    },
+    "ToolsFile": {
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "The only tools the model may call.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "description": "Tools the model may not call.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "arguments": {
+          "description": "Limits on the values of tool arguments.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArgumentFile"
+          }
+        },
+        "action": {
+          "description": "`block` or `flag`.",
+          "$ref": "#/$defs/Action"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "action"
+      ]
+    },
+    "ArgumentFile": {
+      "type": "object",
+      "properties": {
+        "tool": {
+          "type": "string"
+        },
+        "field": {
+          "type": "string"
+        },
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "allow_domains": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tool",
+        "field"
+      ]
+    },
+    "Action": {
+      "description": "What happens when a detector finds something. Ordered by severity.",
+      "oneOf": [
+        {
+          "description": "Forward unchanged, but log the finding.",
+          "type": "string",
+          "const": "flag"
+        },
+        {
+          "description": "Replace the sensitive value with a marker before forwarding.",
+          "type": "string",
+          "const": "redact"
+        },
+        {
+          "description": "Reject the request with 403; nothing reaches the upstream.",
+          "type": "string",
+          "const": "block"
+        }
+      ]
+    },
+    "LimitsFile": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "description": "`route` (default), `api_key` or `header:<name>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requests_per_minute": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "requests_per_day": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_per_minute": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_per_day": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "TestFile": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "description": "The route whose checks apply.",
+          "type": "string"
+        },
+        "input": {
+          "description": "A prompt (set this or `output`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "An answer of the model.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expect": {
+          "description": "An action, or the action with findings and the text after redaction.",
+          "$ref": "#/$defs/ExpectFile"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "expect"
+      ]
+    },
+    "ExpectFile": {
+      "anyOf": [
+        {
+          "description": "`expect: block`",
+          "$ref": "#/$defs/RuleAction"
+        },
+        {
+          "description": "`expect: { action: redact, findings: [pii.email], text: \"...\" }`",
+          "$ref": "#/$defs/ExpectDetail"
+        }
+      ]
+    },
+    "ExpectDetail": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/RuleAction"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "action"
+      ]
+    }
+  }
+}

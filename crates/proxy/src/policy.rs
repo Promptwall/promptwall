@@ -13,13 +13,14 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::uri::{Authority, Scheme};
 use http::Uri;
 use promptwall_detect::{Category, Detector, Kind};
+use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::limits::{LimitKey, Limiter, Limits};
 use crate::tools::{ArgumentRule, ToolRules};
 
 /// What happens when a detector finds something. Ordered by severity.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Forward unchanged, but log the finding.
@@ -42,7 +43,7 @@ impl Action {
 
 /// The action of a detector entry: an [`Action`], or `allow`, which exempts
 /// the entry's entities from later entries.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RuleAction {
     Allow,
@@ -67,7 +68,7 @@ impl RuleAction {
 pub type Except = HashMap<Kind, Vec<String>>;
 
 /// What happens when a request cannot be inspected (too large, compressed, not text).
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailMode {
     /// Forward it uninspected and log a warning.
@@ -83,6 +84,8 @@ pub struct Policy {
     pub routes: Vec<Route>,
     /// Test cases from the policy file, run with `promptwall test`.
     pub tests: Vec<PolicyTest>,
+    /// `sha256:` and the hash of the policy file, in the decision log.
+    pub digest: String,
 }
 
 /// A prompt or answer and what its route is expected to do with it.
@@ -295,12 +298,20 @@ impl Policy {
                 limits: None,
             }],
             tests: Vec::new(),
+            digest: String::new(),
         })
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read policy file {}", path.display()))?;
+        Self::load_signed(path, None)
+    }
+
+    /// Loads a policy file; with a key, only if its signature is valid.
+    pub fn load_signed(
+        path: &Path,
+        key: Option<&crate::signing::PublicKey>,
+    ) -> anyhow::Result<Self> {
+        let text = crate::signing::read_policy(path, key)?;
         Self::from_yaml(&text).with_context(|| format!("invalid policy file {}", path.display()))
     }
 
@@ -454,7 +465,11 @@ impl Policy {
                 })
             })
             .collect::<anyhow::Result<_>>()?;
-        Ok(Self { routes, tests })
+        Ok(Self {
+            routes,
+            tests,
+            digest: digest(text.as_bytes()),
+        })
     }
 
     pub fn route(&self, path: &str, headers: &HeaderMap) -> Option<&Route> {
@@ -747,29 +762,41 @@ fn claim(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(title = "Promptwall policy, version 1")]
 struct PolicyFile {
+    /// Format version. Only 1 exists.
+    #[schemars(range(min = 1, max = 1))]
     version: u32,
+    /// Settings every route has unless it sets its own.
     #[serde(default)]
     defaults: DefaultsFile,
+    /// LLM providers by name, such as `openai`.
     upstreams: BTreeMap<String, UpstreamFile>,
+    /// Matched in order; the first route whose `match` fits a request applies.
     routes: Vec<RouteFile>,
+    /// Sample prompts and answers with what the policy must do with them,
+    /// run by `promptwall test`.
     #[serde(default)]
     tests: Vec<TestFile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TestFile {
     name: Option<String>,
+    /// The route whose checks apply.
     route: String,
+    /// A prompt (set this or `output`).
     input: Option<String>,
+    /// An answer of the model.
     output: Option<String>,
+    /// An action, or the action with findings and the text after redaction.
     expect: ExpectFile,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum ExpectFile {
     /// `expect: block`
@@ -778,7 +805,7 @@ enum ExpectFile {
     Detail(ExpectDetail),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExpectDetail {
     action: RuleAction,
@@ -787,38 +814,51 @@ struct ExpectDetail {
     text: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DefaultsFile {
+    /// What happens to traffic that cannot be inspected: `open` forwards it
+    /// (default), `closed` rejects it.
     fail_mode: Option<FailMode>,
+    /// Only log what would be blocked or redacted; change nothing.
     shadow: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct UpstreamFile {
+    /// Scheme and host, such as `https://api.openai.com`, without a path.
     url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RouteFile {
+    /// Shown in logs, metrics and the decision log.
     name: String,
+    /// Which requests the route applies to; without it, all of them.
     #[serde(rename = "match", default)]
     matcher: MatchFile,
+    /// The name of an entry under `upstreams`.
     upstream: String,
     fail_mode: Option<FailMode>,
     shadow: Option<bool>,
+    /// Checks on the request. For an entity, the first entry that names it wins.
     #[serde(default)]
     input: Vec<DetectorFile>,
+    /// Checks on the model's answer, including streamed answers.
     #[serde(default)]
     output: Vec<DetectorFile>,
+    /// Characters of a streamed answer held back so that a finding split
+    /// across chunks is caught.
     stream_holdback: Option<usize>,
+    /// Tools the model may use, and limits on their arguments.
     tools: Option<ToolsFile>,
+    /// Rate and token limits.
     limits: Option<LimitsFile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct LimitsFile {
     /// `route` (default), `api_key` or `header:<name>`.
@@ -862,18 +902,22 @@ fn compile_limits(spec: LimitsFile) -> anyhow::Result<Limits> {
     Ok(limits)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ToolsFile {
+    /// The only tools the model may call.
     allow: Option<Vec<String>>,
+    /// Tools the model may not call.
     #[serde(default)]
     deny: Vec<String>,
+    /// Limits on the values of tool arguments.
     #[serde(default)]
     arguments: Vec<ArgumentFile>,
+    /// `block` or `flag`.
     action: Action,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ArgumentFile {
     tool: String,
@@ -930,15 +974,17 @@ fn compile_tools(spec: ToolsFile) -> anyhow::Result<ToolRules> {
     })
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct MatchFile {
+    /// Path prefix, such as `/v1/messages`.
     path: Option<String>,
+    /// Headers that must have exactly these values.
     #[serde(default)]
     header: BTreeMap<String, String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DetectorFile {
     detector: DetectorName,
@@ -971,7 +1017,7 @@ struct DetectorFile {
     action: RuleAction,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum DetectorName {
     Pii,
@@ -982,6 +1028,25 @@ enum DetectorName {
     Custom,
     ContentSafety,
     Topics,
+}
+
+/// The JSON Schema of the policy format, for editors and management tools.
+/// Also in docs/specs/policy-v1.schema.json.
+pub fn json_schema() -> String {
+    let mut schema = schemars::schema_for!(PolicyFile);
+    schema.insert(
+        "$id".into(),
+        "https://github.com/Promptwall/promptwall/blob/main/docs/specs/policy-v1.schema.json"
+            .into(),
+    );
+    serde_json::to_string_pretty(&schema).expect("a schema is JSON") + "\n"
+}
+
+/// `sha256:` and the hex SHA-256 of `bytes`.
+pub fn digest(bytes: &[u8]) -> String {
+    let hash = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let hex: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
 }
 
 #[cfg(test)]

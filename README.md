@@ -78,10 +78,11 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | --- | --- |
 | [Architecture](docs/architecture.md) | Components, request path, latency budget, deployment modes |
 | [Threat model](docs/specs/threat-model.md) | What the MVP protects against and what it does not |
-| [Policy format](docs/specs/policy-format.md) | Draft of the YAML policy language |
+| [Policy format](docs/specs/policy-format.md) | The YAML policy language (version 1, stable) and its [JSON Schema](docs/specs/policy-v1.schema.json) |
 | [Benchmark](docs/specs/benchmark.md) | How latency and detection accuracy are measured |
 | [Models](docs/models.md) | Tier 2 classifiers: model format, latency and accuracy of open models |
-| [Monitoring](docs/monitoring.md) | Prometheus metrics and the Grafana dashboard |
+| [Monitoring](docs/monitoring.md) | Prometheus metrics, the Grafana dashboard and the decision log |
+| [Signed policies](docs/policy-signing.md) | Accepting only policies signed by your management server or CI |
 
 ## Contributing
 

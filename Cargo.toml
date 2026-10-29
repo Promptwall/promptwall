@@ -10,6 +10,7 @@ repository = "https://github.com/promptwall/promptwall"
 rust-version = "1.82"
 
 [workspace.dependencies]
+base64 = "0.22"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -18,6 +19,8 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "tokio", "http1", "http2"] }
+ring = "0.17"
+schemars = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

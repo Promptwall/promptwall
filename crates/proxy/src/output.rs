@@ -43,6 +43,8 @@ pub struct OutputCheck {
     pub pii: Option<(Arc<PiiRule>, Arc<PiiModel>)>,
     /// The end of the request's prompt, to judge the answer in context.
     pub prompt: String,
+    /// The request's decision log event, if the log is on.
+    pub decision: Option<crate::decision::Record>,
 }
 
 impl OutputCheck {
@@ -124,6 +126,9 @@ impl OutputCheck {
 
     fn log(&self, action: Action, findings: &BTreeMap<String, usize>, streamed: bool) {
         crate::metrics::findings(&self.route, "response", findings);
+        if let Some(record) = &self.decision {
+            record.update(|e| e.response.record(action, findings));
+        }
         tracing::info!(
             route = %self.route,
             action = action.as_str(),
@@ -226,6 +231,9 @@ fn unscannable(check: &OutputCheck, parts: Parts, body: ProxyBody) -> Response<P
         &[("route", &check.route), ("direction", "response")],
         1,
     );
+    if let Some(record) = &check.decision {
+        record.update(|e| e.response.uninspected = true);
+    }
     if check.fail_closed && !check.shadow {
         return json_error(
             StatusCode::BAD_GATEWAY,
