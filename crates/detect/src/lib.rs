@@ -1,4 +1,5 @@
-//! Tier 1 detectors: pattern-based PII, secret and prompt-injection detection.
+//! Tier 1 detectors: pattern-based PII, secret and prompt-injection detection,
+//! and checks on model output (exfiltration links, system prompt leaks).
 //!
 //! Every detector is a regular expression plus a validator (a checksum, a
 //! valid range) that removes false positives, and for generic formats a
@@ -11,12 +12,14 @@
 //! The crate does no I/O and has no async code so that it can be compiled to
 //! WebAssembly and run inside the npm package as well as the proxy.
 
+mod leak;
 mod rules;
 
 use std::fmt;
 
 use regex::{Regex, RegexSet};
 
+pub use leak::SystemPromptIndex;
 use rules::{Validator, RULES};
 
 /// What a finding is. Built-in kinds have stable IDs from [`Kind::id`], which
@@ -64,6 +67,14 @@ pub enum Kind {
     /// Verdict of the Tier 2 injection classifier. This crate never reports it;
     /// it exists so policies can name it next to the pattern-based kinds.
     InjectionClassifier,
+    /// A markdown image pointing at another site: rendering it sends a request
+    /// there, with whatever the model put into the URL.
+    MarkdownImage,
+    HtmlImage,
+    /// A link whose query string carries a long encoded value.
+    UrlWithData,
+    /// The answer repeats the app's system prompt; see [`SystemPromptIndex`].
+    SystemPromptLeak,
     /// A pattern or keyword list defined in a policy.
     Custom(u16),
 }
@@ -74,12 +85,16 @@ pub enum Category {
     Pii,
     Secret,
     Injection,
+    /// Model output that would send data to another site when rendered.
+    Exfiltration,
+    /// Model output that repeats the app's own instructions.
+    Leak,
     Custom,
 }
 
 impl Kind {
     /// All built-in kinds.
-    pub const ALL: [Kind; 38] = [
+    pub const ALL: [Kind; 42] = [
         Kind::Email,
         Kind::Phone,
         Kind::Iban,
@@ -118,6 +133,10 @@ impl Kind {
         Kind::ChatTemplate,
         Kind::HiddenText,
         Kind::InjectionClassifier,
+        Kind::MarkdownImage,
+        Kind::HtmlImage,
+        Kind::UrlWithData,
+        Kind::SystemPromptLeak,
     ];
 
     pub fn category(self) -> Category {
@@ -143,6 +162,8 @@ impl Kind {
             | Kind::ChatTemplate
             | Kind::HiddenText
             | Kind::InjectionClassifier => Category::Injection,
+            Kind::MarkdownImage | Kind::HtmlImage | Kind::UrlWithData => Category::Exfiltration,
+            Kind::SystemPromptLeak => Category::Leak,
             Kind::Custom(_) => Category::Custom,
             _ => Category::Secret,
         }
@@ -190,6 +211,10 @@ impl Kind {
             Kind::ChatTemplate => "chat_template",
             Kind::HiddenText => "hidden_text",
             Kind::InjectionClassifier => "classifier",
+            Kind::MarkdownImage => "markdown_image",
+            Kind::HtmlImage => "html_image",
+            Kind::UrlWithData => "url_with_data",
+            Kind::SystemPromptLeak => "system_prompt",
             Kind::Custom(_) => "custom",
         }
     }
@@ -200,6 +225,8 @@ impl Kind {
             Category::Pii => "pii",
             Category::Secret => "secret",
             Category::Injection => "injection",
+            Category::Exfiltration => "exfiltration",
+            Category::Leak => "leak",
             Category::Custom => "custom",
         };
         format!("{prefix}.{}", self.entity())

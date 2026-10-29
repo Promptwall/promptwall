@@ -49,3 +49,17 @@ routes:
         name: project_names
         keywords: [Project Falcon]
         action: block
+    # Checks on the answer, including streamed answers.
+    output:
+      - detector: secrets
+        action: block
+      - detector: pii
+        entities: [email, iban, credit_card]
+        action: redact
+      # Images and links that would carry conversation data to another server.
+      - detector: exfiltration
+        allow_domains: [openai.com]
+        action: block
+      # The answer repeats ten or more words of the system prompt.
+      - detector: system_prompt_leak
+        action: block

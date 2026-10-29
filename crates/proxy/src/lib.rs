@@ -6,6 +6,7 @@
 //! Responses are always streamed back without buffering.
 
 pub mod inspect;
+pub mod output;
 pub mod policy;
 
 use std::convert::Infallible;
@@ -28,7 +29,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use promptwall_classify::Classifier;
-use promptwall_detect::Kind;
+use promptwall_detect::{Kind, SystemPromptIndex};
 use tokio::net::TcpListener;
 
 pub use policy::Policy;
@@ -152,7 +153,22 @@ impl Proxy {
             .headers
             .insert(header::HOST, route.upstream.host.clone());
 
-        if !route.inspects_input() {
+        if let Some(rules) = &route.output {
+            // Answers must arrive uncompressed to be scanned.
+            parts.headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+            parts.extensions.insert(Arc::new(output::OutputCheck {
+                route: route.name.clone(),
+                rules: rules.clone(),
+                shadow: route.shadow,
+                fail_closed: route.fail_mode == FailMode::Closed,
+                system: None,
+            }));
+        }
+
+        if !route.reads_request() {
             return Ok(self
                 .forward(Request::from_parts(parts, body.boxed()), None)
                 .await);
@@ -175,13 +191,35 @@ impl Proxy {
         };
 
         let classifier = route.classifier().zip(self.inner.classifier.clone());
+        let leak_words = route.output.as_ref().and_then(|o| o.leak_words);
+        let leak_check = leak_words.is_some();
         let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
             Err(inspect::Unscannable)
         } else {
-            inspect::inspect(&route.detector, &route.input, &body, classifier.is_some())
+            inspect::inspect(
+                &route.detector,
+                &route.input,
+                &body,
+                inspect::Collect {
+                    untrusted: classifier.is_some(),
+                    trusted: leak_check,
+                },
+            )
         };
         let mut outcome = match outcome {
-            Ok(outcome) => outcome,
+            Ok(mut outcome) => {
+                if let (Some(words), Some(rules)) = (leak_words, &route.output) {
+                    let system = std::mem::take(&mut outcome.trusted_text);
+                    parts.extensions.insert(Arc::new(output::OutputCheck {
+                        route: route.name.clone(),
+                        rules: rules.clone(),
+                        shadow: route.shadow,
+                        fail_closed: route.fail_mode == FailMode::Closed,
+                        system: Some(SystemPromptIndex::new(&system, words)),
+                    }));
+                }
+                outcome
+            }
             Err(inspect::Unscannable) => {
                 tracing::warn!(route = %route.name, bytes = body.len(), compressed, fail_mode = ?route.fail_mode, "request body could not be inspected");
                 return Ok(self.uninspected(route, parts, body).await);
@@ -304,6 +342,7 @@ impl Proxy {
         req: Request<ProxyBody>,
         action: Option<Action>,
     ) -> Response<ProxyBody> {
+        let check = req.extensions().get::<Arc<output::OutputCheck>>().cloned();
         match self.inner.client.request(req).await {
             Ok(resp) => {
                 let (mut parts, body) = resp.into_parts();
@@ -313,7 +352,10 @@ impl Proxy {
                         .headers
                         .insert(ACTION_HEADER, HeaderValue::from_static(action.as_str()));
                 }
-                Response::from_parts(parts, body.boxed())
+                match check {
+                    Some(check) => output::check(check, parts, body).await,
+                    None => Response::from_parts(parts, body.boxed()),
+                }
             }
             Err(err) => {
                 tracing::warn!(error = %err, "upstream request failed");

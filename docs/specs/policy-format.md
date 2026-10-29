@@ -12,7 +12,8 @@
 | `routes[].input` with `detector: pii` or `secrets`, `entities`, `action: block \| redact \| flag` | Yes |
 | `routes[].input` with `detector: custom`, `name`, `pattern` or `keywords`, `action` | Yes |
 | `routes[].input` with `detector: prompt_injection`, `entities`, `threshold`, `parallel`, `action` | Yes |
-| `mode: indirect`, `untrusted_content`, `output`, `rules`, `limits`, `tests` | Not yet |
+| `routes[].output` with `detector: pii`, `secrets`, `custom`, `exfiltration` (`allow_domains`), `system_prompt_leak` (`min_words`), `action`; `routes[].stream_holdback` | Yes |
+| `mode: indirect`, `untrusted_content`, `tools`, `rules`, `limits`, `tests` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
 
@@ -36,6 +37,9 @@ Entity names. An empty `entities` list means all entities of that detector. When
 | `prompt_injection` | `chat_template` | Chat-template control tokens in user text (`<\|im_start\|>`, `[INST]`, `<<SYS>>`) that forge a system turn |
 | `prompt_injection` | `hidden_text` | Text a person cannot see: Unicode tag characters, bidi overrides, runs of zero-width characters or variation selectors |
 | `prompt_injection` | `classifier` | The Tier 2 model's score is at or above `threshold`; only with `--injection-model` |
+| `exfiltration` | `markdown_image`, `html_image` | An image the client would load from an outside URL (`![x](https://...)`, `<img src="https://...">`); loading it sends whatever is in the URL to that server |
+| `exfiltration` | `url_with_data` | A link whose query carries a long encoded value (32+ characters of base64, hex or URL encoding with digits in it) |
+| `system_prompt_leak` | (none) | The answer repeats `min_words` (default 10) consecutive words of the request's system prompt, ignoring case and punctuation |
 
 Context keywords must appear within 48 bytes before the value. They keep generic numbers such as order IDs from being reported as tax IDs.
 
@@ -66,6 +70,32 @@ input:
     keywords: [Project Falcon, Bluebird]
     action: block
 ```
+
+## Response checks
+
+`output` detectors check what the provider answers before the app sees it. `pii`, `secrets` and `custom` work as on input; `exfiltration` and `system_prompt_leak` exist only here, and `prompt_injection` only on input.
+
+```yaml
+output:
+  - detector: secrets
+    action: block
+  - detector: pii
+    entities: [email, iban]
+    action: redact
+  - detector: exfiltration
+    allow_domains: [example.com]   # and its subdomains
+    action: block
+  - detector: system_prompt_leak
+    min_words: 12
+    action: block
+stream_holdback: 128
+```
+
+A JSON answer is read whole and every string in it is checked. `block` replaces the answer with a `403` error, `redact` puts markers in place of the values, `flag` only logs. `system_prompt_leak` compares the answer with the system prompt of the same request (system and developer messages, `system`, `instructions`, `systemInstruction`).
+
+Streamed answers (`text/event-stream`, as with `"stream": true`) are checked as they pass. The text of each event (`delta.content`, `delta.text`, `delta`) is joined into the running answer, and the last `stream_holdback` characters (default 128) are held back until the next events arrive, so a value split across events is seen whole before any part of it reaches the app. A redaction rewrites the events that carry the value; a block drops the held-back events, sends an `event: error` with a `promptwall_policy_violation` body and closes the provider connection. Text sent before a finding cannot be called back; a larger holdback catches longer values at the cost of a slightly later first token. Final events that repeat the whole answer (`response.completed`, `*.done`) are checked on their own.
+
+The proxy asks the provider for uncompressed answers on routes with `output` detectors. Answers it still cannot read (compressed, binary JSON, over 4 MiB) follow `fail_mode`.
 
 `fail_mode` applies to request bodies that cannot be inspected: compressed bodies, bodies over 4 MiB, and binary bodies. Bodies over 32 MiB are always rejected with `413`.
 
@@ -107,8 +137,8 @@ routes:
     output:
       - detector: system_prompt_leak
         action: block
-      - detector: markdown_exfiltration
-        action: redact
+      - detector: exfiltration
+        action: block
     limits:
       requests_per_minute: 600
       tokens_per_day: 2_000_000

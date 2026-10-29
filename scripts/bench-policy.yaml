@@ -12,3 +12,12 @@ routes:
         action: block
       - detector: pii
         action: redact
+    output:
+      - detector: secrets
+        action: block
+      - detector: pii
+        action: redact
+      - detector: exfiltration
+        action: block
+      - detector: system_prompt_leak
+        action: block
