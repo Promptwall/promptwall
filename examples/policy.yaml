@@ -2,6 +2,7 @@
 #   promptwall --policy examples/policy.yaml
 # and, to add the Tier 2 injection classifier (see docs/models.md):
 #   promptwall --policy examples/policy.yaml --injection-model models/injection
+# (--safety-model, --topic-model and --pii-model add the other Tier 2 models).
 # Format: docs/specs/policy-format.md
 version: 1
 
@@ -35,6 +36,10 @@ routes:
       # - detector: topics
       #   deny: [politics, medical advice]
       #   action: block
+      # With --pii-model: names and addresses (see docs/models.md):
+      # - detector: pii
+      #   entities: [person, street_address, postcode]
+      #   action: redact
 
   - name: openai
     upstream: openai

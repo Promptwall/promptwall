@@ -52,6 +52,18 @@ const SYSTEM_FIELDS: [&str; 4] = [
     "system_instruction",
 ];
 
+/// Keys of all prompt text, written by the user, tools or the app.
+pub(crate) const PROMPT_KEYS: [&str; 8] = [
+    TEXT_KEYS[0],
+    TEXT_KEYS[1],
+    TEXT_KEYS[2],
+    TEXT_KEYS[3],
+    SYSTEM_FIELDS[0],
+    SYSTEM_FIELDS[1],
+    SYSTEM_FIELDS[2],
+    SYSTEM_FIELDS[3],
+];
+
 /// The body could not be read as JSON or UTF-8 text.
 #[derive(Debug)]
 pub struct Unscannable;

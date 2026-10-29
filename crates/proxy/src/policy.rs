@@ -90,6 +90,15 @@ pub struct Route {
     pub safety: Option<SafetyRule>,
     /// Allowed and denied topics of the request (Tier 2 zero-shot model).
     pub topics: Option<TopicRule>,
+    /// Names, addresses and other entities in the request (Tier 2 PII model).
+    pub pii: Option<Arc<PiiRule>>,
+}
+
+/// The `pii` entities that a Tier 2 token-classification model finds.
+#[derive(Clone, Debug, Default)]
+pub struct PiiRule {
+    /// Action and threshold per lower-case entity name, such as `person`.
+    pub entities: BTreeMap<String, (Action, f32)>,
 }
 
 /// A `content_safety` entry.
@@ -125,6 +134,8 @@ pub struct OutputRules {
     pub holdback: usize,
     /// Harmful content in the answer (Tier 2 moderation model).
     pub safety: Option<SafetyRule>,
+    /// Names, addresses and other entities in the answer (Tier 2 PII model).
+    pub pii: Option<Arc<PiiRule>>,
 }
 
 /// Default for `min_words` on `system_prompt_leak`.
@@ -147,7 +158,10 @@ impl Route {
     }
 
     pub fn inspects_input(&self) -> bool {
-        !self.input.is_empty() || self.safety.is_some() || self.topics.is_some()
+        !self.input.is_empty()
+            || self.safety.is_some()
+            || self.topics.is_some()
+            || self.pii.is_some()
     }
 
     /// Whether the request body must be read: to inspect it, to check the
@@ -217,6 +231,7 @@ impl Policy {
                 tools: None,
                 safety: None,
                 topics: None,
+                pii: None,
             }],
         })
     }
@@ -269,6 +284,7 @@ impl Policy {
                 parallel,
                 safety,
                 topics,
+                pii,
                 ..
             } = compile_detectors(&spec.input, Side::Input)
                 .with_context(|| format!("route {name:?} input"))?;
@@ -293,6 +309,7 @@ impl Policy {
                         leak_words: None,
                         holdback: DEFAULT_HOLDBACK,
                         safety: None,
+                        pii: None,
                     })
                 })
             } else {
@@ -305,6 +322,7 @@ impl Policy {
                     leak_words: out.leak_words,
                     holdback: spec.stream_holdback.unwrap_or(DEFAULT_HOLDBACK),
                     safety: out.safety,
+                    pii: out.pii,
                 }))
             };
             routes.push(Route {
@@ -324,6 +342,7 @@ impl Policy {
                 tools,
                 safety,
                 topics,
+                pii,
                 name,
             });
         }
@@ -344,6 +363,7 @@ struct Compiled {
     leak_words: Option<usize>,
     safety: Option<SafetyRule>,
     topics: Option<TopicRule>,
+    pii: Option<Arc<PiiRule>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -364,6 +384,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
     let mut leak_words = None;
     let mut safety = None;
     let mut topics = None;
+    let mut pii = PiiRule::default();
     for spec in specs {
         match (spec.detector, side) {
             (DetectorName::PromptInjection, Side::Output) => {
@@ -403,9 +424,12 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
             ensure!(
                 matches!(
                     spec.detector,
-                    DetectorName::PromptInjection | DetectorName::ContentSafety | DetectorName::Topics
+                    DetectorName::PromptInjection
+                        | DetectorName::ContentSafety
+                        | DetectorName::Topics
+                        | DetectorName::Pii
                 ),
-                "threshold is only allowed on the prompt_injection, content_safety and topics detectors"
+                "threshold is only allowed on the prompt_injection, content_safety, topics and pii detectors"
             );
             ensure!(
                 (0.0..=1.0).contains(&t),
@@ -459,7 +483,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
             }
             _ => {}
         }
-        if let Some(t) = spec.threshold {
+        if let (Some(t), DetectorName::PromptInjection) = (spec.threshold, spec.detector) {
             threshold.get_or_insert(t);
         }
         let category = match spec.detector {
@@ -498,26 +522,49 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
             spec.name.is_none() && spec.pattern.is_none() && spec.keywords.is_none(),
             "name, pattern and keywords are only allowed on custom detectors"
         );
+        // PII entities that are not built in are left to the PII model, which
+        // `Proxy::with_models` checks them against.
+        let mut model_entities = Vec::new();
         let kinds: Vec<Kind> = if spec.entities.is_empty() {
             Kind::ALL
                 .into_iter()
                 .filter(|k| k.category() == category)
                 .collect()
         } else {
-            spec.entities
-                .iter()
-                .map(|e| {
-                    Kind::from_entity(category, e).with_context(|| {
+            let mut kinds = Vec::new();
+            for e in &spec.entities {
+                match Kind::from_entity(category, e) {
+                    Some(kind) => kinds.push(kind),
+                    None if category == Category::Pii
+                        && !e.is_empty()
+                        && e.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+                    {
+                        model_entities.push(e.clone())
+                    }
+                    None => {
                         let known: Vec<_> = Kind::ALL
                             .iter()
                             .filter(|k| k.category() == category)
                             .map(|k| k.entity())
                             .collect();
-                        format!("unknown entity {e:?}; known: {}", known.join(", "))
-                    })
-                })
-                .collect::<anyhow::Result<_>>()?
+                        bail!("unknown entity {e:?}; known: {}", known.join(", "))
+                    }
+                }
+            }
+            kinds
         };
+        if spec.threshold.is_some() && category == Category::Pii {
+            ensure!(
+                !model_entities.is_empty(),
+                "threshold on pii applies to entities found by the PII model, such as person; this entry lists none"
+            );
+        }
+        let threshold_here = spec.threshold.unwrap_or(crate::ner::DEFAULT_THRESHOLD);
+        for e in model_entities {
+            pii.entities
+                .entry(e)
+                .or_insert((spec.action, threshold_here));
+        }
         for kind in kinds {
             actions.entry(kind).or_insert(spec.action);
         }
@@ -531,6 +578,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         leak_words,
         safety,
         topics,
+        pii: (!pii.entities.is_empty()).then(|| Arc::new(pii)),
     })
 }
 
@@ -771,7 +819,7 @@ routes:
         assert!(err(&format!("{base}routes: [{{ name: r, upstream: b }}]"))
             .contains("unknown upstream"));
         assert!(err(&format!(
-            "{base}routes: [{{ name: r, upstream: a, input: [{{ detector: pii, entities: [ssn], action: block }}] }}]"
+            "{base}routes: [{{ name: r, upstream: a, input: [{{ detector: secrets, entities: [ssn], action: block }}] }}]"
         ))
         .contains("unknown entity \"ssn\""));
         // A field from the spec that this version does not support yet.
@@ -797,8 +845,16 @@ routes:
         );
         assert!(custom("{ detector: pii, pattern: 'x', action: block }")
             .contains("only allowed on custom"));
+        assert!(
+            custom("{ detector: secrets, threshold: 0.9, action: block }")
+                .contains("only allowed on the prompt_injection")
+        );
         assert!(custom("{ detector: pii, threshold: 0.9, action: block }")
-            .contains("only allowed on the prompt_injection"));
+            .contains("applies to entities found by the PII model"));
+        assert!(
+            custom("{ detector: pii, entities: [Person], action: block }")
+                .contains("unknown entity \"Person\"")
+        );
         assert!(
             custom("{ detector: prompt_injection, threshold: 2, action: block }")
                 .contains("between 0 and 1")

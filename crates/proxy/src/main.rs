@@ -43,16 +43,31 @@ struct Args {
     #[arg(long, env = "PROMPTWALL_TOPIC_MODEL")]
     topic_model: Option<PathBuf>,
 
+    /// Directory with an ONNX token-classification (NER) model that finds
+    /// names, addresses and other personal data without a fixed pattern. Its
+    /// entity types (B-PERSON becomes `person`) can then be listed under the
+    /// pii detector.
+    #[arg(long, env = "PROMPTWALL_PII_MODEL")]
+    pii_model: Option<PathBuf>,
+
     /// Classifier sessions that run in parallel (each holds a copy of the model).
     /// Defaults to the number of CPUs, at most 4.
     #[arg(long, env = "PROMPTWALL_MODEL_SESSIONS")]
     model_sessions: Option<usize>,
+
+    /// Threads each classifier session may use for one inference (default 1).
+    /// More threads make each check faster; more sessions let more checks run
+    /// at the same time.
+    #[arg(long, env = "PROMPTWALL_MODEL_THREADS")]
+    model_threads: Option<usize>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into()),
+        )
         .init();
 
     let args = Args::parse();
@@ -65,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
     let mut options = promptwall_classify::Options::default();
     if let Some(n) = args.model_sessions {
         options.sessions = n;
+    }
+    if let Some(n) = args.model_threads {
+        options.threads_per_session = n;
     }
     let load = |what: &str, dir: &std::path::Path| {
         tracing::info!(model = %dir.display(), sessions = options.sessions, "loading {what} model");
@@ -101,6 +119,16 @@ async fn main() -> anyhow::Result<()> {
             load_ms = started.elapsed().as_millis() as u64,
             "topic model loaded"
         );
+    }
+    if let Some(dir) = &args.pii_model {
+        let started = load("PII", dir);
+        let model = promptwall::ner::PiiModel::load(dir, &options)?;
+        tracing::info!(
+            load_ms = started.elapsed().as_millis() as u64,
+            entities = ?model.entities(),
+            "PII model loaded"
+        );
+        models.pii = Some(Arc::new(model));
     }
     let proxy = promptwall::Proxy::with_models(policy, models)?;
     let (listener, addr) = promptwall::bind(args.listen).await?;

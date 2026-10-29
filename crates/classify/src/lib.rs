@@ -19,6 +19,10 @@
 //! over the labels. A text can be scored together with a second text, as in
 //! natural language inference (premise and hypothesis) or a moderation model
 //! that judges an answer together with its prompt: see [`Pair`].
+//!
+//! Token-classification (NER) models, whose logits are shaped
+//! `[batch, tokens, labels]` with `B-`/`I-` labels such as `B-PERSON`, find
+//! entities in a text instead: see [`Classifier::entities`].
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +74,10 @@ pub struct Options {
     /// Most windows scored per text. Longer texts are scored on their last
     /// windows, where the newest user input is.
     pub max_windows: usize,
+    /// Most tokens [`Classifier::entities`] tags in one call, over all its
+    /// texts and counting window overlaps. Entities must be found everywhere,
+    /// so a call that needs more fails instead of skipping text.
+    pub max_tag_tokens: usize,
 }
 
 impl Default for Options {
@@ -79,6 +87,7 @@ impl Default for Options {
             sessions: cpus.min(4),
             threads_per_session: 1,
             max_windows: 8,
+            max_tag_tokens: 32_768,
         }
     }
 }
@@ -101,6 +110,7 @@ pub struct Classifier {
     pair: Option<PairTemplate>,
     token_type_ids: bool,
     max_windows: usize,
+    max_tag_tokens: usize,
 }
 
 impl std::fmt::Debug for Classifier {
@@ -197,6 +207,7 @@ impl Classifier {
             max_len,
             pair,
             max_windows: options.max_windows.max(1),
+            max_tag_tokens: options.max_tag_tokens.max(1),
         })
     }
 
@@ -308,6 +319,31 @@ impl Classifier {
     /// Runs the model on `rows` as one padded batch; returns each row's label
     /// probabilities.
     fn run(&self, rows: &[(Vec<u32>, Vec<i64>)]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let (out_shape, logits) = self.infer(rows)?;
+        ensure!(
+            out_shape.len() == 2 && out_shape[0] == rows.len(),
+            "unexpected logits shape {out_shape:?}"
+        );
+        let labels = out_shape[1];
+        ensure!(
+            labels > 0 && self.positive < labels.max(2),
+            "model has {labels} labels"
+        );
+        Ok(logits
+            .chunks(labels)
+            .map(|row| {
+                if self.multi_label || row.len() == 1 {
+                    row.iter().map(|&x| sigmoid(x)).collect()
+                } else {
+                    softmax(row)
+                }
+            })
+            .collect())
+    }
+
+    /// Runs the model on `rows` as one padded batch; returns the shape and
+    /// values of its first output.
+    fn infer(&self, rows: &[(Vec<u32>, Vec<i64>)]) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
         let batch = rows.len();
         let len = rows.iter().map(|(ids, _)| ids.len()).max().unwrap_or(0);
         let mut ids = vec![i64::from(self.pad_id); batch * len];
@@ -341,26 +377,235 @@ impl Classifier {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let outputs = session.run(inputs)?;
         let (out_shape, logits) = outputs[0].try_extract_tensor::<f32>()?;
+        let shape = out_shape.iter().map(|&d| d.max(0) as usize).collect();
+        Ok((shape, logits.to_vec()))
+    }
+
+    /// Entity types of a token-classification model: its labels without the
+    /// `B-`/`I-` prefix and without `O`, such as `PERSON`.
+    pub fn entity_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = self
+            .labels
+            .iter()
+            .filter_map(|l| entity_type(l).map(str::to_owned))
+            .collect();
+        types.dedup();
+        types
+    }
+
+    /// Entities in each of `texts`, found by a token-classification model,
+    /// with byte offsets into the text and the model's confidence. Long texts
+    /// are tagged in overlapping windows; each token takes its label from the
+    /// window where it has the most context. Blocking and CPU-bound, like
+    /// [`Classifier::score`].
+    pub fn entities(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<Entity>>> {
         ensure!(
-            out_shape.len() == 2 && out_shape[0] as usize == batch,
-            "unexpected logits shape {out_shape:?}"
+            self.labels.iter().any(|l| entity_type(l).is_some()),
+            "the model has no B-/I- entity labels"
         );
-        let labels = out_shape[1] as usize;
-        ensure!(
-            labels > 0 && self.positive < labels.max(2),
-            "model has {labels} labels"
-        );
-        Ok(logits
-            .chunks(labels)
-            .map(|row| {
-                if self.multi_label || row.len() == 1 {
-                    row.iter().map(|&x| sigmoid(x)).collect()
-                } else {
-                    softmax(row)
+        let encodings = texts
+            .iter()
+            .map(|t| self.tokenizer.encode(*t, false))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        // Rows of (text, first token, tokens).
+        let step = self.body - self.stride;
+        let mut rows: Vec<(usize, usize, usize)> = Vec::new();
+        for (t, encoding) in encodings.iter().enumerate() {
+            let n = encoding.get_ids().len();
+            let mut start = 0;
+            while start < n {
+                rows.push((t, start, (n - start).min(self.body)));
+                if start + self.body >= n {
+                    break;
                 }
+                start += step;
+            }
+        }
+        let total: usize = rows.iter().map(|r| r.2).sum();
+        ensure!(
+            total <= self.max_tag_tokens,
+            "the text has {total} tokens to tag, more than the limit of {}",
+            self.max_tag_tokens
+        );
+        // Per text and token: (context on the tighter side, label, probability).
+        let mut best: Vec<Vec<(usize, usize, f32)>> = encodings
+            .iter()
+            .map(|e| vec![(0, 0, 0.0); e.get_ids().len()])
+            .collect();
+        let mut seen: Vec<Vec<bool>> = best.iter().map(|b| vec![false; b.len()]).collect();
+        // Similar lengths go together, so little of each batch is padding.
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_by_key(|&r| rows[r].2);
+        for batch in order.chunks(TAG_BATCH) {
+            let inputs: Vec<(Vec<u32>, Vec<i64>)> = batch
+                .iter()
+                .map(|&r| {
+                    let (t, start, len) = rows[r];
+                    let ids: Vec<u32> = self
+                        .prefix
+                        .iter()
+                        .chain(&encodings[t].get_ids()[start..start + len])
+                        .chain(&self.suffix)
+                        .copied()
+                        .collect();
+                    let types = vec![0; ids.len()];
+                    (ids, types)
+                })
+                .collect();
+            let (shape, logits) = self.infer(&inputs)?;
+            ensure!(
+                shape.len() == 3 && shape[0] == batch.len() && shape[2] == self.labels.len(),
+                "unexpected logits shape {shape:?} for a model with {} labels",
+                self.labels.len()
+            );
+            let (seq, labels) = (shape[1], shape[2]);
+            for (b, &r) in batch.iter().enumerate() {
+                let (t, start, len) = rows[r];
+                for i in 0..len {
+                    let at = (b * seq + self.prefix.len() + i) * labels;
+                    let probs = softmax(&logits[at..at + labels]);
+                    let (label, p) = probs
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .fold((0, f32::MIN), |m, (l, p)| if p > m.1 { (l, p) } else { m });
+                    let context = i.min(len - 1 - i);
+                    let token = start + i;
+                    if !seen[t][token] || context > best[t][token].0 {
+                        best[t][token] = (context, label, p);
+                        seen[t][token] = true;
+                    }
+                }
+            }
+        }
+        Ok(texts
+            .iter()
+            .zip(&encodings)
+            .zip(&best)
+            .map(|((text, encoding), tags)| {
+                let tags = tags.iter().map(|&(_, l, p)| (self.labels[l].as_str(), p));
+                group(text, encoding.get_offsets(), tags)
             })
             .collect())
     }
+}
+
+/// Windows tagged per inference.
+const TAG_BATCH: usize = 16;
+
+/// A span of text a token-classification model tagged.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entity {
+    /// Entity type without `B-`/`I-`, such as `PERSON`.
+    pub label: String,
+    /// Byte offsets into the text.
+    pub start: usize,
+    pub end: usize,
+    /// Mean probability of its tokens' labels.
+    pub score: f32,
+}
+
+/// The entity type of a `B-`/`I-` label.
+fn entity_type(label: &str) -> Option<&str> {
+    label
+        .strip_prefix("B-")
+        .or_else(|| label.strip_prefix("I-"))
+}
+
+/// Joins tagged tokens into entities: a `B-` label starts one, an `I-` label
+/// continues one of the same type. Pieces of one type separated only by
+/// spaces or punctuation (`+49 30 1234567`) are joined, a span that ends or
+/// starts inside a word is widened to the whole word, and whitespace is
+/// trimmed.
+fn group<'a>(
+    text: &str,
+    offsets: &[(usize, usize)],
+    tags: impl Iterator<Item = (&'a str, f32)>,
+) -> Vec<Entity> {
+    // (type, start, end, score sum, tokens)
+    let mut spans: Vec<(&str, usize, usize, f32, usize)> = Vec::new();
+    let mut open = false;
+    for (&(start, end), (label, p)) in offsets.iter().zip(tags) {
+        let Some(kind) = entity_type(label) else {
+            open = false;
+            continue;
+        };
+        match spans.last_mut() {
+            Some(last) if open && label.starts_with("I-") && last.0 == kind => {
+                last.2 = end;
+                last.3 += p;
+                last.4 += 1;
+            }
+            _ => spans.push((kind, start, end, p, 1)),
+        }
+        open = true;
+    }
+    let mut merged: Vec<Entity> = Vec::new();
+    for (kind, start, end, sum, n) in spans {
+        let score = sum / n as f32;
+        if let Some(last) = merged.last_mut() {
+            let gap = text.get(last.end..start).unwrap_or("x");
+            if last.label == kind && gap.len() <= 3 && !gap.chars().any(char::is_alphanumeric) {
+                last.end = end;
+                last.score = last.score.max(score);
+                continue;
+            }
+        }
+        merged.push(Entity {
+            label: kind.to_owned(),
+            start,
+            end,
+            score,
+        });
+    }
+    for e in &mut merged {
+        widen(text, e);
+    }
+    merged.retain(|e| e.end > e.start);
+    // Widening can make neighbours touch or overlap.
+    merged.dedup_by(|later, earlier| {
+        if later.start < earlier.end {
+            earlier.end = earlier.end.max(later.end);
+            true
+        } else {
+            false
+        }
+    });
+    merged
+}
+
+/// Widens `e` to whole words and trims surrounding whitespace. Scripts
+/// written without spaces (Chinese, Japanese) are not widened.
+fn widen(text: &str, e: &mut Entity) {
+    let wordy = |c: char| c.is_alphanumeric() && c < '\u{2E80}';
+    let (mut start, mut end) = (e.start.min(text.len()), e.end.min(text.len()));
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    while start < end && text[start..].starts_with(char::is_whitespace) {
+        start += text[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    while end > start && text[..end].ends_with(char::is_whitespace) {
+        end -= text[..end].chars().next_back().map_or(1, char::len_utf8);
+    }
+    if start < end {
+        if text[start..].starts_with(wordy) {
+            while let Some(c) = text[..start].chars().next_back().filter(|&c| wordy(c)) {
+                start -= c.len_utf8();
+            }
+        }
+        if text[..end].ends_with(wordy) {
+            while let Some(c) = text[end..].chars().next().filter(|&c| wordy(c)) {
+                end += c.len_utf8();
+            }
+        }
+    }
+    e.start = start;
+    e.end = end;
 }
 
 impl PairTemplate {
@@ -474,6 +719,44 @@ mod tests {
         assert!((softmax(&[0.0, 0.0])[1] - 0.5).abs() < 1e-6);
         assert!(softmax(&[0.0, 4.0])[1] > 0.98);
         assert!(sigmoid(4.0) > 0.98);
+    }
+
+    #[test]
+    fn groups_tokens_into_entities() {
+        let text = "Hi Anna Müller, call +49 30 1234567 now";
+        // Tokens: "Hi", " Anna", " Mü", "ller", ",", " call", " +49", " 30", " 1234567", " now"
+        let offsets = [
+            (0, 2),
+            (2, 7),
+            (7, 11),
+            (11, 15),
+            (15, 16),
+            (16, 21),
+            (21, 25),
+            (25, 28),
+            (28, 36),
+            (36, 40),
+        ];
+        let tags = [
+            "O", "B-PERSON", "I-PERSON", "O", "O", "O", "B-PHONE", "B-PHONE", "I-PHONE", "O",
+        ];
+        let found = group(text, &offsets, tags.iter().map(|&t| (t, 0.9)));
+        let spans: Vec<(&str, &str)> = found
+            .iter()
+            .map(|e| (e.label.as_str(), &text[e.start..e.end]))
+            .collect();
+        // "ller" was missed by the model, but a name is never cut in half.
+        assert_eq!(
+            spans,
+            [("PERSON", "Anna Müller"), ("PHONE", "+49 30 1234567")]
+        );
+        // An I- label after O starts an entity of its own.
+        let found = group(
+            "a b",
+            &[(0, 1), (1, 3)],
+            ["O", "I-PERSON"].into_iter().map(|t| (t, 0.8)),
+        );
+        assert_eq!((found[0].start, found[0].end), (2, 3));
     }
 
     #[test]

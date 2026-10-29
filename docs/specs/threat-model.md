@@ -25,7 +25,7 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 | OWASP item | MVP coverage | Detector tier |
 | --- | --- | --- |
 | LLM01 Prompt injection (direct and indirect) | **In scope.** Direct injection and jailbreaks in user input; indirect injection in content the app marks as untrusted | Tier 1 heuristics, Tier 2 classifier |
-| LLM02 Sensitive information disclosure | **In scope.** PII (EU first: names, emails, phones, IBANs, card numbers, national IDs) and secrets, both directions; block or redact | Tier 1 |
+| LLM02 Sensitive information disclosure | **In scope.** PII (EU first: names, emails, phones, IBANs, card numbers, national IDs) and secrets, both directions; block or redact | Tier 1; names and addresses Tier 2 |
 | LLM05 Improper output handling | **Partly.** Markdown image and link exfiltration, dangerous URLs | Tier 1 |
 | LLM07 System prompt leakage | **In scope.** Detects the system prompt echoed in output | Tier 1 (similarity) |
 | LLM10 Unbounded consumption | **Basic.** Per-key request and token rate limits | Proxy |
@@ -42,7 +42,7 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 - Content safety and topic checks are classifiers: they give false alarms (about 2 to 4% of benign prompts for the default safety model, mostly role-play) and miss some harmful content, more so in languages with less training data. Answers are judged in steps of about 256 bytes when streamed.
 - The system prompt leak check catches near-verbatim copies. A paraphrase or translation of the system prompt is not caught.
 - The app's own system prompt is trusted and not checked for injection. Indirect injection through retrieved content is only caught where that content arrives as user or tool text; marking untrusted spans explicitly comes later.
-- Pattern-based PII detection finds structured data: emails, international phone numbers, IBANs, card numbers, BIC and VAT numbers, several national IDs (DE, NL, ES, IT, FR, PL, UK, US) and IP addresses, plus company-specific patterns and keyword lists. It does not find names, addresses, free-text health data or national phone formats; those need the ML tier. Generic numeric IDs are only reported next to a context keyword, so an unlabelled tax ID is missed by design to avoid false positives.
+- Pattern-based PII detection finds structured data: emails, international phone numbers, IBANs, card numbers, BIC and VAT numbers, several national IDs (DE, NL, ES, IT, FR, PL, UK, US) and IP addresses, plus company-specific patterns and keyword lists. Names, street addresses, postcodes and similar values need the optional PII model (`--pii-model`), which also redacts public figures' names, since it cannot tell them apart. Free-text health data and national phone formats are not found yet. Generic numeric IDs are only reported next to a context keyword, so an unlabelled tax ID is missed by design to avoid false positives.
 - Encodings and languages: MVP normalizes Unicode, invisible characters and base64; non-English coverage is best-effort until the multilingual model ships.
 - Content a provider sees before the firewall decides (optimistic forwarding) is never released to the user if a check fails, but it has been sent upstream. Routes handling sensitive data must disable optimistic forwarding.
 - The firewall itself handles sensitive data. It stores no prompt content unless logging is explicitly enabled, and redacts before logging.

@@ -1,0 +1,8 @@
+{
+  "id2label": {
+    "0": "O",
+    "1": "B-PERSON",
+    "2": "I-PERSON"
+  },
+  "max_position_embeddings": 8
+}
