@@ -5,6 +5,7 @@
 //! body once, run the Tier 1 detectors and then forward, redact or block.
 //! Responses are always streamed back without buffering.
 
+pub mod init;
 pub mod inspect;
 pub mod limits;
 pub mod moderation;

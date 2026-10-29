@@ -73,6 +73,12 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Ask a few questions and write a policy file.
+    Init {
+        /// Where to write it.
+        #[arg(default_value = "promptwall.yaml")]
+        file: PathBuf,
+    },
     /// Check the policy file and that the models it needs are loaded.
     Validate,
     /// Run the test cases in the policy's `tests` section.
@@ -93,6 +99,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(Command::Init { file }) = &args.command {
+        return promptwall::init::run(file);
+    }
     // Commands other than the proxy print their own results.
     let default_filter = if args.command.is_some() {
         "warn,ort=warn"
@@ -171,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     let proxy = promptwall::Proxy::with_models(policy, models)?;
     match args.command {
         None => {}
+        Some(Command::Init { .. }) => unreachable!("handled above"),
         Some(Command::Validate) => {
             println!("policy is valid: {}", routes.join(", "));
             return Ok(());
