@@ -15,6 +15,9 @@ use http::Uri;
 use promptwall_detect::{Category, Detector, Kind};
 use serde::Deserialize;
 
+use crate::limits::{LimitKey, Limiter, Limits};
+use crate::tools::{ArgumentRule, ToolRules};
+
 /// What happens when a detector finds something. Ordered by severity.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +40,32 @@ impl Action {
     }
 }
 
+/// The action of a detector entry: an [`Action`], or `allow`, which exempts
+/// the entry's entities from later entries.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuleAction {
+    Allow,
+    Flag,
+    Redact,
+    Block,
+}
+
+impl RuleAction {
+    fn action(self) -> Option<Action> {
+        match self {
+            RuleAction::Allow => None,
+            RuleAction::Flag => Some(Action::Flag),
+            RuleAction::Redact => Some(Action::Redact),
+            RuleAction::Block => Some(Action::Block),
+        }
+    }
+}
+
+/// Values that are not findings, per kind: case-insensitive patterns where
+/// `*` stands for any run of characters, such as `*@example.com`.
+pub type Except = HashMap<Kind, Vec<String>>;
+
 /// What happens when a request cannot be inspected (too large, compressed, not text).
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +81,24 @@ pub enum FailMode {
 #[derive(Debug)]
 pub struct Policy {
     pub routes: Vec<Route>,
+    /// Test cases from the policy file, run with `promptwall test`.
+    pub tests: Vec<PolicyTest>,
+}
+
+/// A prompt or answer and what its route is expected to do with it.
+#[derive(Clone, Debug)]
+pub struct PolicyTest {
+    pub name: String,
+    pub route: String,
+    /// The text, and whether it is an answer (`output`) rather than a prompt.
+    pub text: String,
+    pub output: bool,
+    /// `None` means nothing is found.
+    pub action: Option<Action>,
+    /// Finding labels that must be among the findings, such as `pii.email`.
+    pub findings: Vec<String>,
+    /// The text as it must be sent on, with redactions.
+    pub expect_text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -72,6 +119,8 @@ pub struct Route {
     /// Action per finding kind on the request. Empty means the request body is
     /// streamed through without inspection.
     pub input: HashMap<Kind, Action>,
+    /// Values on the request that are not findings.
+    pub except: Except,
     /// Built-in detectors plus this route's custom patterns and keyword lists.
     pub detector: Arc<Detector>,
     /// Classifier score at or above which a prompt counts as an injection, if
@@ -82,12 +131,58 @@ pub struct Route {
     pub classifier_parallel: bool,
     /// Checks on the provider's response, if the route has any.
     pub output: Option<Arc<OutputRules>>,
+    /// Which tools the model may be offered and call, if limited.
+    pub tools: Option<Arc<ToolRules>>,
+    /// Harmful content in the request (Tier 2 moderation model).
+    pub safety: Option<SafetyRule>,
+    /// Allowed and denied topics of the request (Tier 2 zero-shot model).
+    pub topics: Option<TopicRule>,
+    /// Names, addresses and other entities in the request (Tier 2 PII model).
+    pub pii: Option<Arc<PiiRule>>,
+    /// Rate and token limits, with their counters.
+    pub limits: Option<Arc<Limiter>>,
+}
+
+/// The `pii` entities that a Tier 2 token-classification model finds.
+#[derive(Clone, Debug, Default)]
+pub struct PiiRule {
+    /// Lower-case entity name, such as `person`, and what applies to it.
+    pub entities: BTreeMap<String, ModelEntity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelEntity {
+    pub action: Action,
+    pub threshold: f32,
+    /// Values that are not findings, as in [`Except`].
+    pub except: Vec<String>,
+}
+
+/// A `content_safety` entry.
+#[derive(Clone, Debug)]
+pub struct SafetyRule {
+    /// Categories that count; empty means any harmful content.
+    pub categories: Vec<String>,
+    /// Overrides the model's own threshold.
+    pub threshold: Option<f32>,
+    pub action: Action,
+}
+
+/// A `topics` entry.
+#[derive(Clone, Debug)]
+pub struct TopicRule {
+    pub deny: Vec<String>,
+    pub allow: Vec<String>,
+    pub threshold: f32,
+    pub action: Action,
 }
 
 /// The `output` detectors of a route.
 #[derive(Debug)]
 pub struct OutputRules {
     pub actions: HashMap<Kind, Action>,
+    /// Values in the answer that are not findings.
+    pub except: Except,
     pub detector: Detector,
     /// Hosts (and their subdomains) that links and images may point to.
     pub allow_domains: Vec<String>,
@@ -96,6 +191,10 @@ pub struct OutputRules {
     /// Characters of a streamed answer held back so that a value split across
     /// chunks is still seen whole before it is sent on.
     pub holdback: usize,
+    /// Harmful content in the answer (Tier 2 moderation model).
+    pub safety: Option<SafetyRule>,
+    /// Names, addresses and other entities in the answer (Tier 2 PII model).
+    pub pii: Option<Arc<PiiRule>>,
 }
 
 /// Default for `min_words` on `system_prompt_leak`.
@@ -119,12 +218,21 @@ impl Route {
 
     pub fn inspects_input(&self) -> bool {
         !self.input.is_empty()
+            || self.safety.is_some()
+            || self.topics.is_some()
+            || self.pii.is_some()
     }
 
-    /// Whether the request body must be read: to inspect it, or to learn the
-    /// system prompt that the leak check compares the answer with.
+    /// Whether the request body must be read: to inspect it, to check the
+    /// tools it offers, or to learn the system prompt that the leak check
+    /// compares the answer with and the prompt the answer is judged with.
     pub fn reads_request(&self) -> bool {
-        self.inspects_input() || self.output.as_ref().is_some_and(|o| o.leak_words.is_some())
+        self.inspects_input()
+            || self.tools.is_some()
+            || self
+                .output
+                .as_ref()
+                .is_some_and(|o| o.leak_words.is_some() || o.safety.is_some())
     }
 
     /// Threshold and action for the injection classifier, if this route uses it.
@@ -175,11 +283,18 @@ impl Policy {
                 fail_mode: FailMode::Open,
                 shadow: false,
                 input: HashMap::new(),
+                except: Except::new(),
                 detector: Arc::new(Detector::new()),
                 threshold: None,
                 classifier_parallel: true,
                 output: None,
+                tools: None,
+                safety: None,
+                topics: None,
+                pii: None,
+                limits: None,
             }],
+            tests: Vec::new(),
         })
     }
 
@@ -226,27 +341,59 @@ impl Policy {
                 .collect::<anyhow::Result<_>>()?;
             let Compiled {
                 actions: input,
+                except,
                 detector,
                 threshold,
                 parallel,
+                safety,
+                topics,
+                pii,
                 ..
             } = compile_detectors(&spec.input, Side::Input)
                 .with_context(|| format!("route {name:?} input"))?;
+            let limits = spec
+                .limits
+                .map(compile_limits)
+                .transpose()
+                .with_context(|| format!("route {name:?} limits"))?
+                .map(|l| Arc::new(Limiter::new(l)));
+            let tools = spec
+                .tools
+                .map(compile_tools)
+                .transpose()
+                .with_context(|| format!("route {name:?} tools"))?
+                .map(Arc::new);
             let output = if spec.output.is_empty() {
                 ensure!(
                     spec.stream_holdback.is_none(),
                     "route {name:?}: stream_holdback needs output detectors"
                 );
-                None
+                // Tool calls in the answer are checked on the same path as
+                // output detectors, with none of those configured.
+                tools.as_ref().map(|_| {
+                    Arc::new(OutputRules {
+                        actions: HashMap::new(),
+                        except: Except::new(),
+                        detector: Detector::new(),
+                        allow_domains: Vec::new(),
+                        leak_words: None,
+                        holdback: DEFAULT_HOLDBACK,
+                        safety: None,
+                        pii: None,
+                    })
+                })
             } else {
                 let out = compile_detectors(&spec.output, Side::Output)
                     .with_context(|| format!("route {name:?} output"))?;
                 Some(Arc::new(OutputRules {
                     actions: out.actions,
+                    except: out.except,
                     detector: out.detector,
                     allow_domains: out.allow_domains,
                     leak_words: out.leak_words,
                     holdback: spec.stream_holdback.unwrap_or(DEFAULT_HOLDBACK),
+                    safety: out.safety,
+                    pii: out.pii,
                 }))
             };
             routes.push(Route {
@@ -259,14 +406,55 @@ impl Policy {
                     .unwrap_or_default(),
                 shadow: spec.shadow.or(file.defaults.shadow).unwrap_or(false),
                 input,
+                except,
                 detector: Arc::new(detector),
                 threshold,
                 classifier_parallel: parallel.unwrap_or(true),
                 output,
+                tools,
+                safety,
+                topics,
+                pii,
+                limits,
                 name,
             });
         }
-        Ok(Self { routes })
+        let tests = file
+            .tests
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let (text, output) = match (t.input, t.output) {
+                    (Some(text), None) => (text, false),
+                    (None, Some(text)) => (text, true),
+                    _ => bail!("test {}: set either input or output", i + 1),
+                };
+                ensure!(
+                    routes.iter().any(|r: &Route| r.name == t.route),
+                    "test {}: unknown route {:?}",
+                    i + 1,
+                    t.route
+                );
+                let (action, findings, expect_text) = match t.expect {
+                    ExpectFile::Action(action) => (action, Vec::new(), None),
+                    ExpectFile::Detail(d) => (d.action, d.findings, d.text),
+                };
+                let name = t.name.unwrap_or_else(|| {
+                    let short: String = text.chars().take(40).collect();
+                    format!("{}: {short}", t.route)
+                });
+                Ok(PolicyTest {
+                    name,
+                    route: t.route,
+                    text,
+                    output,
+                    action: action.action(),
+                    findings,
+                    expect_text,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self { routes, tests })
     }
 
     pub fn route(&self, path: &str, headers: &HeaderMap) -> Option<&Route> {
@@ -276,11 +464,15 @@ impl Policy {
 
 struct Compiled {
     actions: HashMap<Kind, Action>,
+    except: Except,
     detector: Detector,
     threshold: Option<f32>,
     parallel: Option<bool>,
     allow_domains: Vec<String>,
     leak_words: Option<usize>,
+    safety: Option<SafetyRule>,
+    topics: Option<TopicRule>,
+    pii: Option<Arc<PiiRule>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -293,13 +485,33 @@ enum Side {
 /// it, and builds the detector with the route's custom patterns and keyword lists.
 /// Also returns the classifier settings, if any are set.
 fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compiled> {
-    let mut actions = HashMap::new();
+    // `None` for kinds an `allow` entry exempts.
+    let mut actions: HashMap<Kind, Option<Action>> = HashMap::new();
+    let mut except = Except::new();
+    let mut model_entities: BTreeMap<String, Option<ModelEntity>> = BTreeMap::new();
     let mut builder = Detector::builder();
     let mut threshold = None;
     let mut parallel = None;
     let mut allow_domains = Vec::new();
     let mut leak_words = None;
+    let mut safety = None;
+    let mut topics = None;
     for spec in specs {
+        let action = spec.action.action();
+        if !spec.except.is_empty() {
+            ensure!(action.is_some(), "except is meaningless with action: allow");
+            ensure!(
+                matches!(
+                    spec.detector,
+                    DetectorName::Pii
+                        | DetectorName::Secrets
+                        | DetectorName::Custom
+                        | DetectorName::PromptInjection
+                        | DetectorName::Exfiltration
+                ),
+                "except is only allowed on the pii, secrets, custom, prompt_injection and exfiltration detectors"
+            );
+        }
         match (spec.detector, side) {
             (DetectorName::PromptInjection, Side::Output) => {
                 bail!("prompt_injection checks requests; use it under input")
@@ -336,16 +548,80 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         }
         if let Some(t) = spec.threshold {
             ensure!(
-                matches!(spec.detector, DetectorName::PromptInjection),
-                "threshold is only allowed on the prompt_injection detector"
+                matches!(
+                    spec.detector,
+                    DetectorName::PromptInjection
+                        | DetectorName::ContentSafety
+                        | DetectorName::Topics
+                        | DetectorName::Pii
+                ),
+                "threshold is only allowed on the prompt_injection, content_safety, topics and pii detectors"
             );
             ensure!(
                 (0.0..=1.0).contains(&t),
                 "threshold must be between 0 and 1"
             );
+        }
+        ensure!(
+            matches!(spec.detector, DetectorName::Topics)
+                || (spec.deny.is_empty() && spec.allow.is_empty()),
+            "deny and allow are only allowed on the topics detector"
+        );
+        // Model-based content checks: one entry each, without finding kinds.
+        // The classifier cannot point at a span, so redact blocks.
+        let model_action = match action {
+            Some(Action::Redact) => Action::Block,
+            Some(action) => action,
+            None if matches!(
+                spec.detector,
+                DetectorName::ContentSafety | DetectorName::Topics
+            ) =>
+            {
+                bail!("action: allow is not available on content_safety and topics; leave the entry out instead")
+            }
+            None => Action::Flag, // unused
+        };
+        match spec.detector {
+            DetectorName::ContentSafety => {
+                ensure!(safety.is_none(), "content_safety is listed twice");
+                safety = Some(SafetyRule {
+                    categories: spec.entities.clone(),
+                    threshold: spec.threshold,
+                    action: model_action,
+                });
+                continue;
+            }
+            DetectorName::Topics => {
+                ensure!(
+                    side == Side::Input,
+                    "topics checks requests; use it under input"
+                );
+                ensure!(topics.is_none(), "topics is listed twice");
+                ensure!(
+                    spec.entities.is_empty(),
+                    "topics has no entities; use deny and allow"
+                );
+                ensure!(
+                    !(spec.deny.is_empty() && spec.allow.is_empty()),
+                    "topics needs deny or allow"
+                );
+                topics = Some(TopicRule {
+                    deny: spec.deny.clone(),
+                    allow: spec.allow.clone(),
+                    threshold: spec
+                        .threshold
+                        .unwrap_or(crate::moderation::DEFAULT_THRESHOLD),
+                    action: model_action,
+                });
+                continue;
+            }
+            _ => {}
+        }
+        if let (Some(t), DetectorName::PromptInjection) = (spec.threshold, spec.detector) {
             threshold.get_or_insert(t);
         }
         let category = match spec.detector {
+            DetectorName::ContentSafety | DetectorName::Topics => unreachable!("handled above"),
             DetectorName::Pii => Category::Pii,
             DetectorName::Secrets => Category::Secret,
             DetectorName::PromptInjection => Category::Injection,
@@ -355,7 +631,9 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
                     spec.entities.is_empty(),
                     "system_prompt_leak has no entities"
                 );
-                leak_words.get_or_insert(spec.min_words.unwrap_or(DEFAULT_LEAK_WORDS));
+                if action.is_some() {
+                    leak_words.get_or_insert(spec.min_words.unwrap_or(DEFAULT_LEAK_WORDS));
+                }
                 Category::Leak
             }
             DetectorName::Custom => {
@@ -372,7 +650,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
                     (None, Some(words)) => builder.keywords(name, words)?,
                     _ => bail!("custom detector {name:?} needs either pattern or keywords"),
                 };
-                actions.entry(kind).or_insert(spec.action);
+                claim(&mut actions, &mut except, kind, action, &spec.except);
                 continue;
             }
         };
@@ -380,38 +658,93 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
             spec.name.is_none() && spec.pattern.is_none() && spec.keywords.is_none(),
             "name, pattern and keywords are only allowed on custom detectors"
         );
+        // PII entities that are not built in are left to the PII model, which
+        // `Proxy::with_models` checks them against.
+        let mut model_names = Vec::new();
         let kinds: Vec<Kind> = if spec.entities.is_empty() {
             Kind::ALL
                 .into_iter()
                 .filter(|k| k.category() == category)
                 .collect()
         } else {
-            spec.entities
-                .iter()
-                .map(|e| {
-                    Kind::from_entity(category, e).with_context(|| {
+            let mut kinds = Vec::new();
+            for e in &spec.entities {
+                match Kind::from_entity(category, e) {
+                    Some(kind) => kinds.push(kind),
+                    None if category == Category::Pii
+                        && !e.is_empty()
+                        && e.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
+                    {
+                        model_names.push(e.clone())
+                    }
+                    None => {
                         let known: Vec<_> = Kind::ALL
                             .iter()
                             .filter(|k| k.category() == category)
                             .map(|k| k.entity())
                             .collect();
-                        format!("unknown entity {e:?}; known: {}", known.join(", "))
-                    })
-                })
-                .collect::<anyhow::Result<_>>()?
+                        bail!("unknown entity {e:?}; known: {}", known.join(", "))
+                    }
+                }
+            }
+            kinds
         };
+        if spec.threshold.is_some() && category == Category::Pii {
+            ensure!(
+                !model_names.is_empty(),
+                "threshold on pii applies to entities found by the PII model, such as person; this entry lists none"
+            );
+        }
+        for e in model_names {
+            model_entities
+                .entry(e)
+                .or_insert(action.map(|action| ModelEntity {
+                    action,
+                    threshold: spec.threshold.unwrap_or(crate::ner::DEFAULT_THRESHOLD),
+                    except: spec.except.clone(),
+                }));
+        }
         for kind in kinds {
-            actions.entry(kind).or_insert(spec.action);
+            claim(&mut actions, &mut except, kind, action, &spec.except);
         }
     }
+    let pii = PiiRule {
+        entities: model_entities
+            .into_iter()
+            .filter_map(|(name, e)| Some((name, e?)))
+            .collect(),
+    };
     Ok(Compiled {
-        actions,
+        actions: actions
+            .into_iter()
+            .filter_map(|(kind, action)| Some((kind, action?)))
+            .collect(),
+        except,
         detector: builder.build(),
         threshold,
         parallel,
         allow_domains,
         leak_words,
+        safety,
+        topics,
+        pii: (!pii.entities.is_empty()).then(|| Arc::new(pii)),
     })
+}
+
+/// Gives `kind` the action of this entry, unless an earlier entry has it.
+fn claim(
+    actions: &mut HashMap<Kind, Option<Action>>,
+    except: &mut Except,
+    kind: Kind,
+    action: Option<Action>,
+    values: &[String],
+) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = actions.entry(kind) {
+        slot.insert(action);
+        if !values.is_empty() {
+            except.insert(kind, values.to_vec());
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -422,6 +755,36 @@ struct PolicyFile {
     defaults: DefaultsFile,
     upstreams: BTreeMap<String, UpstreamFile>,
     routes: Vec<RouteFile>,
+    #[serde(default)]
+    tests: Vec<TestFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestFile {
+    name: Option<String>,
+    route: String,
+    input: Option<String>,
+    output: Option<String>,
+    expect: ExpectFile,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExpectFile {
+    /// `expect: block`
+    Action(RuleAction),
+    /// `expect: { action: redact, findings: [pii.email], text: "..." }`
+    Detail(ExpectDetail),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectDetail {
+    action: RuleAction,
+    #[serde(default)]
+    findings: Vec<String>,
+    text: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -451,6 +814,120 @@ struct RouteFile {
     #[serde(default)]
     output: Vec<DetectorFile>,
     stream_holdback: Option<usize>,
+    tools: Option<ToolsFile>,
+    limits: Option<LimitsFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    /// `route` (default), `api_key` or `header:<name>`.
+    key: Option<String>,
+    requests_per_minute: Option<u64>,
+    requests_per_day: Option<u64>,
+    tokens_per_minute: Option<u64>,
+    tokens_per_day: Option<u64>,
+}
+
+fn compile_limits(spec: LimitsFile) -> anyhow::Result<Limits> {
+    let key = match spec.key.as_deref().map(str::trim) {
+        None | Some("route") => LimitKey::Route,
+        Some("api_key") => LimitKey::ApiKey,
+        Some(other) => match other.strip_prefix("header:") {
+            Some(name) => LimitKey::Header(
+                HeaderName::try_from(name.trim().to_ascii_lowercase())
+                    .with_context(|| format!("invalid header name {name:?}"))?,
+            ),
+            None => bail!("key must be route, api_key or header:<name>, not {other:?}"),
+        },
+    };
+    let limits = Limits {
+        key,
+        requests_per_minute: spec.requests_per_minute,
+        requests_per_day: spec.requests_per_day,
+        tokens_per_minute: spec.tokens_per_minute,
+        tokens_per_day: spec.tokens_per_day,
+    };
+    let all = [
+        limits.requests_per_minute,
+        limits.requests_per_day,
+        limits.tokens_per_minute,
+        limits.tokens_per_day,
+    ];
+    ensure!(all.iter().any(Option::is_some), "set at least one limit");
+    ensure!(
+        all.iter().flatten().all(|&n| n > 0),
+        "limits must be above 0"
+    );
+    Ok(limits)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolsFile {
+    allow: Option<Vec<String>>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    arguments: Vec<ArgumentFile>,
+    action: Action,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArgumentFile {
+    tool: String,
+    field: String,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    allow_domains: Vec<String>,
+}
+
+fn compile_tools(spec: ToolsFile) -> anyhow::Result<ToolRules> {
+    ensure!(
+        spec.action != Action::Redact,
+        "action must be block or flag: a tool call cannot be redacted"
+    );
+    ensure!(
+        spec.allow.is_some() || !spec.deny.is_empty() || !spec.arguments.is_empty(),
+        "set at least one of allow, deny and arguments"
+    );
+    let arguments = spec
+        .arguments
+        .into_iter()
+        .map(|a| {
+            ensure!(
+                !a.field.trim().is_empty(),
+                "argument rule for {:?} has an empty field",
+                a.tool
+            );
+            ensure!(
+                !(a.allow.is_empty() && a.deny.is_empty() && a.allow_domains.is_empty()),
+                "argument rule for {:?} needs allow, deny or allow_domains",
+                a.tool
+            );
+            Ok(ArgumentRule {
+                field: a.field.split('.').map(str::to_owned).collect(),
+                tool: a.tool,
+                allow: a.allow,
+                deny: a.deny,
+                allow_domains: a
+                    .allow_domains
+                    .iter()
+                    .map(|d| d.trim().trim_start_matches("*.").to_ascii_lowercase())
+                    .collect(),
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(ToolRules {
+        allow: spec.allow,
+        deny: spec.deny,
+        arguments,
+        action: spec.action,
+    })
 }
 
 #[derive(Default, Deserialize)]
@@ -482,7 +959,16 @@ struct DetectorFile {
     allow_domains: Option<Vec<String>>,
     /// system_prompt_leak only: words in a row that count as a leak.
     min_words: Option<usize>,
-    action: Action,
+    /// topics only: topics that are not allowed.
+    #[serde(default)]
+    deny: Vec<String>,
+    /// topics only: the topics a request must be about.
+    #[serde(default)]
+    allow: Vec<String>,
+    /// Values that are not findings, such as the company's own support address.
+    #[serde(default)]
+    except: Vec<String>,
+    action: RuleAction,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -494,6 +980,8 @@ enum DetectorName {
     Exfiltration,
     SystemPromptLeak,
     Custom,
+    ContentSafety,
+    Topics,
 }
 
 #[cfg(test)]
@@ -574,12 +1062,12 @@ routes:
         assert!(err(&format!("{base}routes: [{{ name: r, upstream: b }}]"))
             .contains("unknown upstream"));
         assert!(err(&format!(
-            "{base}routes: [{{ name: r, upstream: a, input: [{{ detector: pii, entities: [ssn], action: block }}] }}]"
+            "{base}routes: [{{ name: r, upstream: a, input: [{{ detector: secrets, entities: [ssn], action: block }}] }}]"
         ))
         .contains("unknown entity \"ssn\""));
         // A field from the spec that this version does not support yet.
         assert!(err(&format!(
-            "{base}routes: [{{ name: r, upstream: a, tools: [] }}]"
+            "{base}routes: [{{ name: r, upstream: a, rules: [] }}]"
         ))
         .contains("unknown field"));
         assert!(err("version: 2\nupstreams: {}\nroutes: []").contains("unsupported policy version"));
@@ -600,8 +1088,16 @@ routes:
         );
         assert!(custom("{ detector: pii, pattern: 'x', action: block }")
             .contains("only allowed on custom"));
+        assert!(
+            custom("{ detector: secrets, threshold: 0.9, action: block }")
+                .contains("only allowed on the prompt_injection")
+        );
         assert!(custom("{ detector: pii, threshold: 0.9, action: block }")
-            .contains("only allowed on the prompt_injection"));
+            .contains("applies to entities found by the PII model"));
+        assert!(
+            custom("{ detector: pii, entities: [Person], action: block }")
+                .contains("unknown entity \"Person\"")
+        );
         assert!(
             custom("{ detector: prompt_injection, threshold: 2, action: block }")
                 .contains("between 0 and 1")

@@ -19,7 +19,10 @@ use hyper::body::{Frame, Incoming};
 use promptwall_detect::{Category, Finding, Kind, SystemPromptIndex};
 use serde_json::Value;
 
-use crate::policy::{Action, OutputRules};
+use crate::moderation::Safety;
+use crate::ner::{PiiModel, Span, Tagged};
+use crate::policy::{Action, OutputRules, PiiRule, SafetyRule};
+use crate::tools::{StreamCalls, ToolCall, ToolRules};
 use crate::{full, json_error, ProxyBody, ACTION_HEADER, MAX_BODY_BYTES, MAX_SCAN_BYTES};
 
 /// What one request needs for checking its response.
@@ -31,12 +34,24 @@ pub struct OutputCheck {
     pub fail_closed: bool,
     /// The request's system prompt, when the leak check is on.
     pub system: Option<SystemPromptIndex>,
+    /// Limits on the tool calls in the answer.
+    pub tools: Option<Arc<ToolRules>>,
+    /// Harmful content in the answer, with the model that judges it.
+    pub safety: Option<(SafetyRule, Arc<Safety>)>,
+    /// Names, addresses and other entities in the answer, with the model that
+    /// finds them.
+    pub pii: Option<(Arc<PiiRule>, Arc<PiiModel>)>,
+    /// The end of the request's prompt, to judge the answer in context.
+    pub prompt: String,
 }
 
 impl OutputCheck {
     /// Findings in `text` that the route acts on, sorted and without overlaps.
     fn scan(&self, text: &str) -> Vec<(Finding, Action)> {
         let rules = &self.rules;
+        if rules.actions.is_empty() {
+            return Vec::new(); // only tool calls are checked
+        }
         let mut found: Vec<Finding> = rules
             .detector
             .scan(text)
@@ -46,6 +61,7 @@ impl OutputCheck {
                 f.kind.category() != Category::Exfiltration
                     || !allowed(&text[f.start..f.end], &rules.allow_domains)
             })
+            .filter(|f| !crate::inspect::excepted(&rules.except, f.kind, &text[f.start..f.end]))
             .collect();
         if let Some(index) = &self.system {
             if rules.actions.contains_key(&Kind::SystemPromptLeak) {
@@ -66,6 +82,25 @@ impl OutputCheck {
             .collect()
     }
 
+    /// Records the tool calls that break the route's tool rules; returns the
+    /// action they call for.
+    fn check_tools(
+        &self,
+        calls: &[ToolCall],
+        findings: &mut BTreeMap<String, usize>,
+    ) -> Option<Action> {
+        let rules = self.tools.as_ref()?;
+        let mut hit = false;
+        for call in calls {
+            for label in rules.check(call) {
+                tracing::debug!(route = %self.route, tool = %call.name, label, "tool call rejected");
+                *findings.entry(label.to_owned()).or_insert(0) += 1;
+                hit = true;
+            }
+        }
+        hit.then_some(rules.action)
+    }
+
     fn label(&self, kind: Kind) -> String {
         self.rules.detector.label(kind)
     }
@@ -82,6 +117,11 @@ impl OutputCheck {
         }
     }
 
+    /// Whether a Tier 2 model must see answer text before it is sent.
+    fn models_gate(&self) -> bool {
+        self.safety.is_some() || self.pii.is_some()
+    }
+
     fn log(&self, action: Action, findings: &BTreeMap<String, usize>, streamed: bool) {
         tracing::info!(
             route = %self.route,
@@ -92,6 +132,47 @@ impl OutputCheck {
             "sensitive data in response"
         );
     }
+}
+
+/// Checks one answer text the way [`whole`] checks an answer, for
+/// [`crate::Proxy::check`]. Blocking: the models run inline.
+pub(crate) fn check_text(check: &OutputCheck, text: &str) -> anyhow::Result<crate::Verdict> {
+    let mut verdict = crate::Verdict {
+        text: text.to_owned(),
+        ..Default::default()
+    };
+    let found = check.scan(text);
+    let mut spans = Vec::new();
+    for (f, action) in &found {
+        *verdict.findings.entry(check.label(f.kind)).or_insert(0) += 1;
+        verdict.action = verdict.action.max(Some(*action));
+        if *action == Action::Redact {
+            spans.push((f.start, f.end, check.marker(f.kind)));
+        }
+    }
+    if !spans.is_empty() {
+        verdict.text = rewrite(text, 0, &spans);
+    }
+    if let Some((rule, model)) = &check.safety {
+        let labels = model.check(text, None, rule)?;
+        if !labels.is_empty() {
+            verdict.action = verdict.action.max(Some(rule.action));
+        }
+        for label in labels {
+            *verdict.findings.entry(label).or_insert(0) += 1;
+        }
+    }
+    if let Some((rule, model)) = &check.pii {
+        let tagged = model.tag_text(rule, &mut verdict.text)?;
+        for (label, n) in tagged.findings {
+            *verdict.findings.entry(label).or_insert(0) += n;
+        }
+        verdict.action = verdict.action.max(tagged.action);
+    }
+    if verdict.action != Some(Action::Redact) {
+        verdict.text = text.to_owned();
+    }
+    Ok(verdict)
 }
 
 /// Whether the host of `url` is one of `domains` or a subdomain of one.
@@ -189,18 +270,66 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
             changed = true;
         }
     };
-    let new_body = if let Ok(mut json) = serde_json::from_slice::<Value>(&bytes) {
-        crate::inspect::visit_strings(&mut json, None, false, &mut |s, _, _| apply(s));
-        changed.then(|| Bytes::from(serde_json::to_vec(&json).unwrap_or_default()))
+    let mut tool_action = None;
+    // The answer's text, for the moderation model.
+    let mut answer = String::new();
+    let doc = if let Ok(mut json) = serde_json::from_slice::<Value>(&bytes) {
+        crate::inspect::visit_strings(&mut json, None, false, &mut |s, key, _| {
+            if check.safety.is_some() && key.is_some_and(|k| ANSWER_KEYS.contains(&k)) {
+                answer.push_str(s);
+                answer.push('\n');
+            }
+            apply(s)
+        });
+        let mut tool_findings = BTreeMap::new();
+        tool_action = check.check_tools(&crate::tools::calls(&json), &mut tool_findings);
+        findings.extend(tool_findings);
+        Doc::Json(json)
     } else if let Ok(text) = std::str::from_utf8(&bytes) {
         let mut text = text.to_owned();
+        if check.safety.is_some() {
+            answer = text.clone();
+        }
         apply(&mut text);
-        changed.then(|| Bytes::from(text))
+        Doc::Text(text)
     } else {
         return unscannable(&check, parts, full(bytes));
     };
+    let (doc, pii_action) = match tag_answer(&check, doc).await {
+        Ok((doc, tagged)) => {
+            changed |= tagged.changed;
+            for (label, n) in tagged.findings {
+                *findings.entry(label).or_insert(0) += n;
+            }
+            (doc, tagged.action)
+        }
+        Err(_) if check.fail_closed && !check.shadow => return unjudged(),
+        Err(Some(doc)) => (doc, None),
+        // The model panicked and took the answer with it: without it, the
+        // redactions made so far cannot be sent.
+        Err(None) if changed && !check.shadow => return unjudged(),
+        Err(None) => return Response::from_parts(parts, full(bytes)),
+    };
+    let new_body = match doc {
+        Doc::Json(json) if changed => {
+            Some(Bytes::from(serde_json::to_vec(&json).unwrap_or_default()))
+        }
+        Doc::Text(text) if changed => Some(Bytes::from(text)),
+        _ => None,
+    };
+    let safety_action = match judge(&check, answer).await {
+        Ok(Some((labels, action))) => {
+            for label in labels {
+                *findings.entry(label).or_insert(0) += 1;
+            }
+            Some(action)
+        }
+        Ok(None) => None,
+        Err(()) if check.fail_closed && !check.shadow => return unjudged(),
+        Err(()) => None,
+    };
 
-    let Some(action) = action else {
+    let Some(action) = action.max(tool_action).max(safety_action).max(pii_action) else {
         return Response::from_parts(parts, full(bytes));
     };
     check.log(action, &findings, false);
@@ -225,6 +354,79 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
             .insert(ACTION_HEADER, HeaderValue::from_static(action.as_str()));
     }
     Response::from_parts(parts, full(body))
+}
+
+/// JSON keys whose strings are the text of an answer (`content`, `text`),
+/// as opposed to IDs, roles or tool arguments.
+const ANSWER_KEYS: [&str; 2] = ["content", "text"];
+
+/// A whole answer, parsed.
+enum Doc {
+    Json(Value),
+    Text(String),
+}
+
+/// Runs the PII model on a whole answer, if the route has model entities on
+/// its answers, and redacts. When the model fails, `Err` holds the answer
+/// as it was, or `None` if it was lost to a panic.
+async fn tag_answer(check: &Arc<OutputCheck>, doc: Doc) -> Result<(Doc, Tagged), Option<Doc>> {
+    let Some((rule, model)) = check.pii.clone() else {
+        return Ok((doc, Tagged::default()));
+    };
+    let task = tokio::task::spawn_blocking(move || {
+        let mut doc = doc;
+        let tagged = match &mut doc {
+            Doc::Json(json) => model.tag_json(&rule, json, &ANSWER_KEYS),
+            Doc::Text(text) => model.tag_text(&rule, text),
+        };
+        (doc, tagged)
+    });
+    match task.await {
+        Ok((doc, Ok(tagged))) => Ok((doc, tagged)),
+        Ok((doc, Err(err))) => {
+            tracing::warn!(route = %check.route, error = %format!("{err:#}"), "PII model failed on the answer");
+            Err(Some(doc))
+        }
+        Err(err) => {
+            tracing::warn!(route = %check.route, error = %err, "PII model panicked on the answer");
+            Err(None)
+        }
+    }
+}
+
+/// Runs the moderation model on `text`, if the route has `content_safety` on
+/// its answers. `Ok(None)` when the text is fine, `Err` when the model failed.
+async fn judge(
+    check: &Arc<OutputCheck>,
+    text: String,
+) -> Result<Option<(Vec<String>, Action)>, ()> {
+    let Some((rule, model)) = check.safety.clone() else {
+        return Ok(None);
+    };
+    let prompt = check.prompt.clone();
+    let action = rule.action;
+    let task = tokio::task::spawn_blocking(move || model.check(&text, Some(&prompt), &rule));
+    match task.await {
+        Ok(Ok(labels)) if labels.is_empty() => Ok(None),
+        Ok(Ok(labels)) => Ok(Some((labels, action))),
+        Ok(Err(err)) => {
+            tracing::warn!(route = %check.route, error = %format!("{err:#}"), "safety model failed on the answer");
+            Err(())
+        }
+        Err(err) => {
+            tracing::warn!(route = %check.route, error = %err, "safety model panicked on the answer");
+            Err(())
+        }
+    }
+}
+
+fn unjudged() -> Response<ProxyBody> {
+    json_error(
+        StatusCode::BAD_GATEWAY,
+        "promptwall_uninspectable",
+        "Response blocked by Promptwall: it could not be checked",
+        &[],
+    )
 }
 
 fn blocked_response(findings: &BTreeMap<String, usize>) -> Response<ProxyBody> {
@@ -270,6 +472,9 @@ struct Event {
     /// End of this event's text in the whole answer; it can be sent once the
     /// release point has passed it.
     text_end: usize,
+    /// Part of or after a tool call, held until the calls are checked at the
+    /// end of the stream.
+    held: bool,
 }
 
 enum EventBody {
@@ -280,6 +485,8 @@ enum EventBody {
         json: Value,
         fields: Vec<(Vec<PathPart>, usize)>,
     },
+    /// A final event that repeats the whole answer, waiting for the PII model.
+    Snapshot(Value),
 }
 
 #[derive(Clone)]
@@ -304,7 +511,18 @@ struct Sse {
     findings: BTreeMap<String, usize>,
     action: Option<Action>,
     finished: bool,
+    /// Tool calls seen so far, when the route limits them.
+    calls: StreamCalls,
+    /// Text up to here has passed the Tier 2 models.
+    judged: usize,
+    /// Entities the PII model found in the unsent part, in answer offsets.
+    entities: Vec<Span>,
+    seen_entities: HashSet<(String, usize)>,
 }
+
+/// How much new answer text the Tier 2 models wait for before they check a
+/// streamed answer again, in bytes. Text is released only once checked.
+const JUDGE_EVERY: usize = 256;
 
 /// JSON keys whose string values are answer text in streamed events (OpenAI
 /// chat `delta.content`, Responses `delta`, Anthropic `delta.text`, Gemini
@@ -325,6 +543,10 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
         findings: BTreeMap::new(),
         action: None,
         finished: false,
+        calls: StreamCalls::default(),
+        judged: 0,
+        entities: Vec::new(),
+        seen_entities: HashSet::new(),
     };
     let events = futures_util::stream::unfold(state, |mut state| async move {
         loop {
@@ -340,7 +562,7 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
                 Some(Ok(frame)) => match frame.into_data() {
                     Ok(data) => {
                         state.buf.extend_from_slice(&data);
-                        let out = state.take_events(false);
+                        let out = state.take_events(false).await;
                         if !out.is_empty() {
                             return Some((Ok(Frame::data(out)), state));
                         }
@@ -353,7 +575,7 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
                 }
                 None => {
                     state.upstream = None;
-                    let out = state.take_events(true);
+                    let out = state.take_events(true).await;
                     if !out.is_empty() {
                         return Some((Ok(Frame::data(out)), state));
                     }
@@ -366,14 +588,51 @@ fn stream(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Response
 
 impl Sse {
     /// Parses complete events from the buffer, scans, and returns what may be sent.
-    fn take_events(&mut self, at_end: bool) -> Bytes {
+    async fn take_events(&mut self, at_end: bool) -> Bytes {
         while let Some(raw) = next_event(&mut self.buf, at_end) {
             self.push(raw);
         }
+        let due = at_end || self.text.len() >= self.judged + JUDGE_EVERY;
+        if self.check.models_gate() && due && self.text.len() > self.judged {
+            if self.check.safety.is_some() {
+                match judge(&self.check, self.text.clone()).await {
+                    Ok(Some((labels, action))) => {
+                        for label in labels {
+                            *self.findings.entry(label).or_insert(0) += 1;
+                        }
+                        self.action = self.action.max(Some(action));
+                    }
+                    Ok(None) => {}
+                    Err(()) => self.unchecked("safety.unchecked"),
+                }
+            }
+            if self.tag().await.is_err() {
+                self.unchecked("pii.unchecked");
+            }
+            self.judged = self.text.len();
+        }
+        if self.tag_snapshots().await.is_err() {
+            self.unchecked("pii.unchecked");
+        }
         self.scan(at_end);
+        let text_blocked = self.action == Some(Action::Block);
+        if at_end && !self.calls.is_empty() {
+            let action = self
+                .check
+                .check_tools(&self.calls.finish(), &mut self.findings);
+            self.action = self.action.max(action);
+        }
         if self.action == Some(Action::Block) && !self.check.shadow {
-            // Drop the held-back text, end the stream with an error event and
-            // stop reading from the provider, which closes that connection.
+            // End the stream with an error event and stop reading from the
+            // provider, which closes that connection. Held-back text goes too,
+            // unless only a tool call was rejected: then the text before it
+            // is fine and is sent first.
+            let mut out = BytesMut::new();
+            if !text_blocked {
+                while let Some(event) = self.pending.pop_front().filter(|e| !e.held) {
+                    self.write(event, &mut out);
+                }
+            }
             self.pending.clear();
             self.upstream = None;
             self.finished = true;
@@ -384,9 +643,10 @@ impl Sse {
                 "message": format!("Response blocked by Promptwall policy: {}", kinds.join(", ")),
                 "findings": kinds,
             }});
-            return Bytes::from(format!("event: error\ndata: {error}\n\n"));
+            out.extend_from_slice(format!("event: error\ndata: {error}\n\n").as_bytes());
+            return out.freeze();
         }
-        let release_to = if at_end {
+        let mut release_to = if at_end {
             self.text.len()
         } else {
             floor_char(
@@ -394,11 +654,15 @@ impl Sse {
                 self.text.len().saturating_sub(self.check.rules.holdback),
             )
         };
+        if self.check.models_gate() {
+            // Only text the models have seen goes out.
+            release_to = release_to.min(self.judged);
+        }
         let mut out = BytesMut::new();
         while self
             .pending
             .front()
-            .is_some_and(|e| e.text_end <= release_to)
+            .is_some_and(|e| e.text_end <= release_to && (at_end || !e.held))
         {
             let event = self.pending.pop_front().expect("checked");
             self.released = self.released.max(event.text_end);
@@ -411,12 +675,104 @@ impl Sse {
         out.freeze()
     }
 
+    /// A Tier 2 model failed: on a fail-closed route, the answer is blocked.
+    fn unchecked(&mut self, label: &str) {
+        if self.check.fail_closed {
+            *self.findings.entry(label.to_owned()).or_insert(0) += 1;
+            self.action = Some(Action::Block);
+        }
+    }
+
+    /// Runs the PII model on the unsent text plus some context before it.
+    async fn tag(&mut self) -> Result<(), ()> {
+        let Some((rule, model)) = self.check.pii.clone() else {
+            return Ok(());
+        };
+        let from = floor_char(
+            &self.text,
+            self.released.saturating_sub(self.check.rules.holdback),
+        );
+        let window = self.text[from..].to_owned();
+        let task = tokio::task::spawn_blocking(move || model.find(&[&window], &rule));
+        let spans = match task.await {
+            Ok(Ok(mut spans)) => spans.remove(0),
+            Ok(Err(err)) => {
+                tracing::warn!(route = %self.check.route, error = %format!("{err:#}"), "PII model failed on the answer");
+                return Err(());
+            }
+            Err(err) => {
+                tracing::warn!(route = %self.check.route, error = %err, "PII model panicked on the answer");
+                return Err(());
+            }
+        };
+        self.entities.clear();
+        for span in spans {
+            let span = Span {
+                start: from + span.start,
+                end: from + span.end,
+                ..span
+            };
+            if span.end <= self.released {
+                continue; // already sent: too late to act on
+            }
+            if self.seen_entities.insert((span.entity.clone(), span.start)) {
+                *self.findings.entry(span.label()).or_insert(0) += 1;
+            }
+            self.action = self.action.max(Some(span.action));
+            self.entities.push(span);
+        }
+        Ok(())
+    }
+
+    /// Runs the PII model on final events that repeat the whole answer.
+    async fn tag_snapshots(&mut self) -> Result<(), ()> {
+        let Some((rule, model)) = self.check.pii.clone() else {
+            return Ok(());
+        };
+        for i in 0..self.pending.len() {
+            let EventBody::Snapshot(json) = &mut self.pending[i].body else {
+                continue;
+            };
+            let mut json = std::mem::take(json);
+            // Shadow mode only reports.
+            let keep = self.check.shadow.then(|| json.clone());
+            let (rule, model) = (rule.clone(), model.clone());
+            let task = tokio::task::spawn_blocking(move || {
+                let tagged = model.tag_json(&rule, &mut json, &DELTA_KEYS);
+                (json, tagged)
+            });
+            let (json, tagged) = match task.await {
+                Ok((json, Ok(tagged))) => (json, tagged),
+                Ok((json, Err(err))) => {
+                    tracing::warn!(route = %self.check.route, error = %format!("{err:#}"), "PII model failed on the answer");
+                    self.pending[i].body = EventBody::Snapshot(json);
+                    return Err(());
+                }
+                Err(err) => {
+                    tracing::warn!(route = %self.check.route, error = %err, "PII model panicked on the answer");
+                    return Err(());
+                }
+            };
+            for label in tagged.findings.into_keys() {
+                // The same entity usually streamed as deltas before: count it once.
+                self.findings.entry(label).or_insert(1);
+            }
+            self.action = self.action.max(tagged.action);
+            let event = &mut self.pending[i];
+            let json = keep.unwrap_or(json);
+            event.body = EventBody::Raw(Bytes::from(format!("{}data: {json}\n\n", event.head)));
+        }
+        Ok(())
+    }
+
     fn push(&mut self, raw: Bytes) {
+        let held = !self.calls.is_empty();
         let Ok(block) = std::str::from_utf8(&raw) else {
             return self.pending.push_back(Event {
                 head: String::new(),
                 body: EventBody::Raw(raw),
                 text_end: self.text.len(),
+                held,
             });
         };
         let mut head = String::new();
@@ -438,8 +794,11 @@ impl Sse {
                 head: String::new(),
                 body: EventBody::Raw(raw),
                 text_end: self.text.len(),
+                held,
             });
         };
+        // From the first tool call on, events wait for the end of the stream.
+        let held = (self.check.tools.is_some() && self.calls.feed(&json)) || held;
         // Final events (OpenAI Responses `*.done`, `response.completed`) repeat
         // the whole answer: check them on their own instead of adding them
         // to the running text.
@@ -448,11 +807,17 @@ impl Sse {
             .is_some_and(|t| t.ends_with(".done") || t.ends_with(".completed"));
         if snapshot {
             self.snapshot(&mut json);
-            let text = format!("{head}data: {json}\n\n");
+            let (head, body) = if self.check.pii.is_some() {
+                (head, EventBody::Snapshot(json))
+            } else {
+                let text = format!("{head}data: {json}\n\n");
+                (String::new(), EventBody::Raw(Bytes::from(text)))
+            };
             return self.pending.push_back(Event {
-                head: String::new(),
-                body: EventBody::Raw(Bytes::from(text)),
+                head,
+                body,
                 text_end: self.text.len(),
+                held,
             });
         }
         let mut fields = Vec::new();
@@ -469,6 +834,7 @@ impl Sse {
             head,
             body,
             text_end: self.text.len(),
+            held,
         });
     }
 
@@ -495,6 +861,24 @@ impl Sse {
                     .push((start, end, self.check.marker(f.kind)));
             }
         }
+        if !self.check.shadow && !self.entities.is_empty() {
+            self.redactions.extend(
+                self.entities
+                    .iter()
+                    .filter(|e| e.action == Action::Redact)
+                    .map(|e| (e.start, e.end, e.marker())),
+            );
+            // Keep them sorted and without overlaps, as rewriting needs.
+            self.redactions.sort_by_key(|r| r.0);
+            let mut merged: Vec<(usize, usize, String)> = Vec::new();
+            for r in self.redactions.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if r.0 < last.1 => last.1 = last.1.max(r.1),
+                    _ => merged.push(r),
+                }
+            }
+            self.redactions = merged;
+        }
     }
 
     /// Checks a self-contained event (a final event repeating the answer).
@@ -520,6 +904,10 @@ impl Sse {
     fn write(&self, event: Event, out: &mut BytesMut) {
         match event.body {
             EventBody::Raw(raw) => out.extend_from_slice(&raw),
+            EventBody::Snapshot(json) => {
+                out.extend_from_slice(event.head.as_bytes());
+                out.extend_from_slice(format!("data: {json}\n\n").as_bytes());
+            }
             EventBody::Delta { mut json, fields } => {
                 if !self.redactions.is_empty() {
                     for (path, start) in &fields {

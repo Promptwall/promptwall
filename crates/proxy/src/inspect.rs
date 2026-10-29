@@ -11,7 +11,7 @@ use bytes::Bytes;
 use promptwall_detect::{Category, Detector, Kind};
 use serde_json::Value;
 
-use crate::policy::Action;
+use crate::policy::{Action, Except};
 
 /// Result of inspecting one body.
 #[derive(Debug, Default)]
@@ -52,19 +52,33 @@ const SYSTEM_FIELDS: [&str; 4] = [
     "system_instruction",
 ];
 
+/// Keys of all prompt text, written by the user, tools or the app.
+pub(crate) const PROMPT_KEYS: [&str; 8] = [
+    TEXT_KEYS[0],
+    TEXT_KEYS[1],
+    TEXT_KEYS[2],
+    TEXT_KEYS[3],
+    SYSTEM_FIELDS[0],
+    SYSTEM_FIELDS[1],
+    SYSTEM_FIELDS[2],
+    SYSTEM_FIELDS[3],
+];
+
 /// The body could not be read as JSON or UTF-8 text.
 #[derive(Debug)]
 pub struct Unscannable;
 
 /// Scans every string in a JSON body (or the whole body if it is plain text)
-/// and applies `actions`. JSON keys are not scanned, only values. A redacted
-/// JSON body is re-serialized compactly with its key order preserved. With
-/// `collect`, prompt text is gathered for the classifier and the leak check.
+/// and applies `actions`, except to the values in `except`. JSON keys are not
+/// scanned, only values. A redacted JSON body is re-serialized compactly with
+/// its key order preserved. With `collect`, prompt text is gathered for the
+/// classifier and the leak check.
 pub fn inspect(
     detector: &Detector,
     actions: &HashMap<Kind, Action>,
     body: &[u8],
     collect: Collect,
+    except: &Except,
 ) -> Result<Outcome, Unscannable> {
     let mut outcome = Outcome::default();
     if let Ok(mut json) = serde_json::from_slice::<Value>(body) {
@@ -83,7 +97,7 @@ pub fn inspect(
                     into.push_str(s);
                 }
             }
-            changed |= scan_string(detector, actions, s, trusted, &mut outcome);
+            changed |= scan_string(detector, actions, except, s, trusted, &mut outcome);
         });
         if changed && outcome.action == Some(Action::Redact) {
             // Serializing a parsed Value cannot fail.
@@ -94,7 +108,7 @@ pub fn inspect(
             outcome.untrusted_text = text.to_owned();
         }
         let mut text = text.to_owned();
-        if scan_string(detector, actions, &mut text, false, &mut outcome)
+        if scan_string(detector, actions, except, &mut text, false, &mut outcome)
             && outcome.action == Some(Action::Redact)
         {
             outcome.redacted_body = Some(text.into());
@@ -110,6 +124,7 @@ pub fn inspect(
 fn scan_string(
     detector: &Detector,
     actions: &HashMap<Kind, Action>,
+    except: &Except,
     s: &mut String,
     trusted: bool,
     outcome: &mut Outcome,
@@ -130,6 +145,7 @@ fn scan_string(
         .into_iter()
         .filter(|f| actions.contains_key(&f.kind))
         .filter(|f| !(trusted && f.kind.category() == Category::Injection))
+        .filter(|f| !excepted(except, f.kind, &s[f.start..f.end]))
         .collect();
     if findings.is_empty() {
         return false;
@@ -148,6 +164,13 @@ fn scan_string(
     }
     *s = detector.redact(s, &to_redact);
     true
+}
+
+/// Whether `value`, found as `kind`, matches one of the route's exceptions.
+pub(crate) fn excepted(except: &Except, kind: Kind, value: &str) -> bool {
+    except
+        .get(&kind)
+        .is_some_and(|patterns| patterns.iter().any(|p| crate::tools::glob(p, value.trim())))
 }
 
 /// Calls `f` on every string value with the object key it sits under (arrays
@@ -203,6 +226,7 @@ mod tests {
                 &acts,
                 body.to_string().as_bytes(),
                 Collect::default(),
+                &Default::default(),
             )
             .unwrap();
             assert_eq!(out.action, Some(Action::Flag), "PII still counts in {body}");
@@ -215,6 +239,7 @@ mod tests {
             &acts,
             user.to_string().as_bytes(),
             Collect::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out.action, Some(Action::Block));
@@ -237,6 +262,7 @@ mod tests {
             &acts,
             user.to_string().as_bytes(),
             Collect::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out.action, Some(Action::Block));
@@ -249,6 +275,7 @@ mod tests {
             &acts,
             system.to_string().as_bytes(),
             Collect::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out.action, None);
@@ -262,6 +289,7 @@ mod tests {
             &actions(&[(Kind::Email, Action::Redact)]),
             body,
             Collect::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out.action, Some(Action::Redact));
@@ -286,7 +314,14 @@ mod tests {
             (Kind::Email, Action::Redact),
             (Kind::AwsAccessKey, Action::Block),
         ]);
-        let out = inspect(&Detector::new(), &acts, body, Collect::default()).unwrap();
+        let out = inspect(
+            &Detector::new(),
+            &acts,
+            body,
+            Collect::default(),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(out.action, Some(Action::Block));
         assert!(out.redacted_body.is_none());
     }
@@ -299,6 +334,7 @@ mod tests {
             &actions(&[(Kind::Phone, Action::Flag)]),
             body,
             Collect::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(out.action, Some(Action::Flag));
@@ -318,6 +354,7 @@ mod tests {
             &acts,
             b"hi jane@example.com",
             Collect::default(),
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(&out.redacted_body.unwrap()[..], b"hi [REDACTED:EMAIL]");
@@ -325,7 +362,8 @@ mod tests {
             &Detector::new(),
             &acts,
             &[0xff, 0xfe, 0x00],
-            Collect::default()
+            Collect::default(),
+            &Default::default()
         )
         .is_err());
     }

@@ -84,6 +84,13 @@ async fn handle(
         .get("x-reply")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // And a tool call after the answer text: `x-tool-call: <name> <arguments JSON>`.
+    let tool_call = req
+        .headers()
+        .get("x-tool-call")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .map(|(name, args)| (name.to_owned(), args.to_owned()));
     let reply_chunk = req
         .headers()
         .get("x-reply-chunk")
@@ -100,8 +107,8 @@ async fn handle(
 
     let mut resp = if echo_body {
         Response::new(Full::new(body.clone()).boxed())
-    } else if let Some(reply) = reply {
-        reply_response(&reply, stream, reply_chunk)
+    } else if reply.is_some() || tool_call.is_some() {
+        reply_response(&reply.unwrap_or_default(), tool_call, stream, reply_chunk)
     } else if stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
         tokio::spawn(async move {
@@ -152,12 +159,24 @@ async fn handle(
 /// An OpenAI-style answer with the given text, whole or as a stream of deltas.
 /// Each streamed event is sent as two frames, split mid-event, the way TCP
 /// may deliver it.
-fn reply_response(text: &str, stream: bool, chunk: usize) -> Response<BoxBody<Bytes, Infallible>> {
+fn reply_response(
+    text: &str,
+    tool_call: Option<(String, String)>,
+    stream: bool,
+    chunk: usize,
+) -> Response<BoxBody<Bytes, Infallible>> {
     if !stream {
+        let mut message = serde_json::json!({"role": "assistant", "content": text});
+        if let Some((name, args)) = &tool_call {
+            message["tool_calls"] = serde_json::json!([{
+                "id": "call_mock", "type": "function",
+                "function": {"name": name, "arguments": args},
+            }]);
+        }
         let completion = serde_json::json!({
             "id": "chatcmpl-mock",
             "object": "chat.completion",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         });
         let mut resp = Response::new(Full::new(Bytes::from(completion.to_string())).boxed());
         resp.headers_mut().insert(
@@ -167,13 +186,28 @@ fn reply_response(text: &str, stream: bool, chunk: usize) -> Response<BoxBody<By
         return resp;
     }
     let chars: Vec<char> = text.chars().collect();
+    let mut deltas: Vec<serde_json::Value> = chars
+        .chunks(chunk)
+        .map(|piece| serde_json::json!({"content": piece.iter().collect::<String>()}))
+        .collect();
+    if let Some((name, args)) = tool_call {
+        deltas.push(serde_json::json!({"tool_calls": [{
+            "index": 0, "id": "call_mock", "type": "function",
+            "function": {"name": name, "arguments": ""},
+        }]}));
+        let args: Vec<char> = args.chars().collect();
+        deltas.extend(args.chunks(chunk).map(|piece| {
+            serde_json::json!({"tool_calls": [{
+                "index": 0, "function": {"arguments": piece.iter().collect::<String>()},
+            }]})
+        }));
+    }
     let mut frames: Vec<Bytes> = Vec::new();
-    for piece in chars.chunks(chunk) {
-        let piece: String = piece.iter().collect();
+    for delta in deltas {
         let event = serde_json::json!({
             "id": "chatcmpl-mock",
             "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": piece}}],
+            "choices": [{"index": 0, "delta": delta}],
         });
         let event = format!("data: {event}\n\n");
         let (a, b) = event.split_at(event.len() / 2);
