@@ -15,6 +15,7 @@
 | `routes[].output` with `detector: pii`, `secrets`, `custom`, `exfiltration` (`allow_domains`), `system_prompt_leak` (`min_words`), `action`; `routes[].stream_holdback` | Yes |
 | `routes[].tools` with `allow`, `deny`, `arguments` (`tool`, `field`, `allow`, `deny`, `allow_domains`), `action: block \| flag` | Yes |
 | `routes[].input` with `detector: content_safety` (`entities`, `threshold`) or `detector: topics` (`deny`, `allow`, `threshold`); `routes[].output` with `detector: content_safety` | Yes, with `--safety-model` / `--topic-model` |
+| `detector: pii` with model entities (`person`, `street_address`, ...) and `threshold`, on input and output | Yes, with `--pii-model` |
 | `mode: indirect`, `untrusted_content`, `rules`, `limits`, `tests` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
@@ -30,6 +31,7 @@ Entity names. An empty `entities` list means all entities of that detector. When
 | `pii` | `de_tax_id`, `nl_bsn`, `pl_pesel` | Checksum, only next to a keyword (e.g. "Steuer-ID", "BSN", "PESEL") |
 | `pii` | `es_dni`, `it_fiscal_code`, `fr_nir`, `uk_nino` | Format and check letter or checksum |
 | `pii` | `us_ssn` | `123-45-6789` form, or nine digits next to "SSN" |
+| `pii` | `person`, `street_address`, `postcode`, `location`, `organization`, `date_of_birth`, `age`, `username`, ... | A PII model (`--pii-model`), see [Names and addresses](#names-and-addresses) |
 | `secrets` | `openai_key`, `anthropic_key`, `aws_access_key`, `github_token`, `slack_token`, `stripe_key`, `google_api_key`, `azure_storage_key`, `gcp_service_account`, `huggingface_token`, `npm_token`, `twilio_key`, `sendgrid_key`, `private_key`, `jwt` | Provider token format |
 | `secrets` | `url_credentials` | The password in `scheme://user:password@host` |
 | `secrets` | `password` | The value in `password=...`, `"passwd": "..."` and similar; placeholders are ignored |
@@ -100,9 +102,30 @@ output:
 
 `content_safety` findings are `safety.<category>` (or `safety.unsafe`). `entities` lists the categories that count; the loaded model decides which exist, and an unknown one is an error at startup. `topics` gives `topic.denied` when the prompt is about a denied topic, and `topic.off_topic` when the route has allowed topics and the prompt is about none of them. Both check only text from the user and tools, not the system prompt. They run alongside the provider call like the injection classifier: `parallel` on `prompt_injection` applies to them too. The models cannot point at a span, so `redact` blocks. If a model fails, the route's `fail_mode` decides.
 
+## Names and addresses
+
+Names, street addresses and other personal data without a fixed format need a token-classification model ([models](../models.md#names-and-addresses)). Its entities are listed under `pii` like the built-in ones; a `pii` entry without `entities` still means only the built-in entities.
+
+```yaml
+input:
+  - detector: pii
+    entities: [email, iban, person, street_address, postcode]   # built in and model
+    action: redact
+  - detector: pii
+    entities: [location, organization]
+    threshold: 0.8        # model confidence, default 0.5
+    action: flag
+output:
+  - detector: pii
+    entities: [person]
+    action: redact
+```
+
+Findings are `pii.<entity>` and markers `[REDACTED:PERSON]`. The loaded model decides which entities exist (the recommended one has 29); an entity that is neither built in nor in the model is an error at startup. `threshold` applies to the model entities of its entry. All prompt text is checked, the system prompt included. Model entities are found before the request is forwarded, since they may need redacting, so their latency adds to every request on the route; see [models](../models.md#names-and-addresses). If the model fails, the route's `fail_mode` decides.
+
 ## Response checks
 
-`output` detectors check what the provider answers before the app sees it. `pii`, `secrets`, `custom` and `content_safety` work as on input; `exfiltration` and `system_prompt_leak` exist only here, and `prompt_injection` and `topics` only on input.
+`output` detectors check what the provider answers before the app sees it. `pii` (with model entities), `secrets`, `custom` and `content_safety` work as on input; `exfiltration` and `system_prompt_leak` exist only here, and `prompt_injection` and `topics` only on input.
 
 ```yaml
 output:

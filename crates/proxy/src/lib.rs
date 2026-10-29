@@ -7,6 +7,7 @@
 
 pub mod inspect;
 pub mod moderation;
+pub mod ner;
 pub mod output;
 pub mod policy;
 pub mod tools;
@@ -130,6 +131,32 @@ impl Proxy {
                     "route {name:?} uses topics, but no topic model is loaded (--topic-model)"
                 );
             }
+            let output_pii = route.output.as_ref().and_then(|o| o.pii.as_ref());
+            for rule in route.pii.iter().chain(output_pii) {
+                let builtin = || {
+                    Kind::ALL
+                        .iter()
+                        .filter(|k| k.category() == promptwall_detect::Category::Pii)
+                        .map(|k| k.entity())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let Some(model) = &models.pii else {
+                    let entity = rule.entities.keys().next().map_or("", String::as_str);
+                    anyhow::bail!(
+                        "route {name:?}: unknown pii entity {entity:?}. Built in: {}. Names, addresses and other entities need a PII model (--pii-model)",
+                        builtin()
+                    );
+                };
+                if let Some(unknown) = rule.entities.keys().find(|e| !model.entities().contains(e))
+                {
+                    anyhow::bail!(
+                        "route {name:?}: unknown pii entity {unknown:?}. Built in: {}. The PII model has: {}",
+                        builtin(),
+                        model.entities().join(", ")
+                    );
+                }
+            }
         }
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
@@ -205,6 +232,7 @@ impl Proxy {
                 system: None,
                 tools: route.tools.clone(),
                 safety: rules.safety.clone().zip(self.inner.models.safety.clone()),
+                pii: rules.pii.clone().zip(self.inner.models.pii.clone()),
                 prompt: String::new(),
             }));
         }
@@ -273,6 +301,7 @@ impl Proxy {
                         system: leak_words.map(|words| SystemPromptIndex::new(&system, words)),
                         tools: route.tools.clone(),
                         safety: output_safety.zip(models.safety.clone()),
+                        pii: rules.pii.clone().zip(models.pii.clone()),
                         prompt: last_chars(&outcome.untrusted_text, PROMPT_CONTEXT).to_owned(),
                     }));
                 }
@@ -283,6 +312,36 @@ impl Proxy {
                 return Ok(self.uninspected(route, parts, body).await);
             }
         };
+
+        // Names and addresses are redacted before anything is forwarded.
+        if let Some((rule, model)) = route.pii.clone().zip(models.pii.clone()) {
+            if outcome.action != Some(Action::Block) {
+                let current = outcome
+                    .redacted_body
+                    .clone()
+                    .unwrap_or_else(|| body.clone());
+                let task = tokio::task::spawn_blocking(move || tag_body(&model, &rule, &current));
+                match task.await {
+                    Ok(Ok((tagged, new_body))) => {
+                        for (label, n) in tagged.findings {
+                            *outcome.findings.entry(label).or_default() += n;
+                        }
+                        outcome.action = outcome.action.max(tagged.action);
+                        if new_body.is_some() {
+                            outcome.redacted_body = new_body;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(route = %route.name, error = %format!("{err:#}"), "PII model failed");
+                        return Ok(self.uninspected(route, parts, body).await);
+                    }
+                    Err(err) => {
+                        tracing::warn!(route = %route.name, error = %err, "PII model panicked");
+                        return Ok(self.uninspected(route, parts, body).await);
+                    }
+                }
+            }
+        }
 
         // Tier 2 runs only when Tier 1 has not already blocked the request.
         let task = (!jobs.is_empty()
@@ -498,6 +557,29 @@ pub struct Models {
     pub safety: Option<Arc<moderation::Safety>>,
     /// Zero-shot model for `topics`.
     pub topics: Option<Arc<moderation::Topics>>,
+    /// Token-classification model for `pii` entities that are not built in,
+    /// such as names and addresses.
+    pub pii: Option<Arc<ner::PiiModel>>,
+}
+
+/// Tags the prompt text of a request body with the PII model; returns what it
+/// found and the body with redactions, if any. Blocking and CPU-bound.
+fn tag_body(
+    model: &ner::PiiModel,
+    rule: &policy::PiiRule,
+    body: &[u8],
+) -> anyhow::Result<(ner::Tagged, Option<Bytes>)> {
+    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(body) {
+        let tagged = model.tag_json(rule, &mut json, &inspect::PROMPT_KEYS)?;
+        let new_body = tagged
+            .changed
+            .then(|| Bytes::from(serde_json::to_vec(&json).unwrap_or_default()));
+        return Ok((tagged, new_body));
+    }
+    let mut text = String::from_utf8_lossy(body).into_owned();
+    let tagged = model.tag_text(rule, &mut text)?;
+    let new_body = tagged.changed.then(|| Bytes::from(text));
+    Ok((tagged, new_body))
 }
 
 /// Characters of the prompt kept to judge the answer in context.

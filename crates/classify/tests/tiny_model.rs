@@ -107,3 +107,47 @@ fn scores_a_text_together_with_a_second_one() {
     );
     assert!(entail(&long, Pair::After("report")) > 0.95);
 }
+
+#[test]
+fn tags_entities_in_short_and_long_texts() {
+    // Tags "anna" as B-PERSON and "smith" as I-PERSON; its windows are 6 tokens.
+    let model = fixture("tiny-ner");
+    assert_eq!(model.entity_types(), ["PERSON"]);
+    let filler = "hello please summarise this report ".repeat(5);
+    let texts = [
+        "Hi Anna Smith lives in Berlin".to_owned(),
+        format!("{filler}anna smith is here {filler} Anna"),
+        "nothing to see".to_owned(),
+    ];
+    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let found = model.entities(&texts).unwrap();
+    let spans: Vec<Vec<&str>> = found
+        .iter()
+        .zip(&texts)
+        .map(|(es, t)| es.iter().map(|e| &t[e.start..e.end]).collect())
+        .collect();
+    assert_eq!(spans[0], ["Anna Smith"]);
+    assert_eq!(spans[1], ["anna smith", "Anna"]);
+    assert!(spans[2].is_empty());
+    assert_eq!(found[0][0].label, "PERSON");
+    assert!(found[0][0].score > 0.99);
+}
+
+#[test]
+fn refuses_to_tag_more_than_the_token_limit() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-ner");
+    let model = Classifier::load(
+        &dir,
+        &Options {
+            max_tag_tokens: 12,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(model.entities(&["anna smith"]).is_ok());
+    let long = "hello please summarise this report ".repeat(5);
+    let err = model.entities(&[&long]).unwrap_err();
+    assert!(format!("{err}").contains("more than the limit"));
+    // A classification model has no entity labels.
+    assert!(fixture("tiny").entities(&["anna"]).is_err());
+}

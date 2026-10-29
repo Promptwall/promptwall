@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
                 sessions: 1,
                 threads_per_session: threads,
                 max_windows: 8,
+                ..Options::default()
             },
         )?;
         // About 18 tokens per sentence.
