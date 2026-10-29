@@ -2,7 +2,7 @@
 
 **An open source AI firewall.** Promptwall sits between your application and any LLM and blocks prompt injection, jailbreaks and data leaks in both directions, while adding only single-digit milliseconds of latency.
 
-> **Status: early Phase 1.** Promptwall routes requests by a YAML policy and can block secrets and redact personal data in prompts (pattern-based, Tier 1). Prompt-injection detection and response inspection are not built yet.
+> **Status: early Phase 1.** Promptwall routes requests by a YAML policy and can block secrets and redact personal data in prompts (pattern-based, Tier 1). It blocks prompt injection (patterns plus an optional ONNX classifier) and checks the provider's answers, streamed or not, for leaked secrets, personal data, exfiltration links and system-prompt leaks.
 
 ## Goals
 

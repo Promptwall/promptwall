@@ -1113,6 +1113,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper",
@@ -1175,6 +1176,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "serde_json",
  "tokio",
  "tokio-stream",
 ]

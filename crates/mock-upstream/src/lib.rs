@@ -78,6 +78,18 @@ async fn handle(
     let saw_hop = req.headers().contains_key("x-hop");
     // Lets tests see exactly what the upstream received.
     let echo_body = req.headers().contains_key("x-echo-body");
+    // Lets tests choose the answer, streamed in pieces of `x-reply-chunk` bytes.
+    let reply = req
+        .headers()
+        .get("x-reply")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let reply_chunk = req
+        .headers()
+        .get("x-reply-chunk")
+        .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
     let body = match req.into_body().collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => Bytes::new(),
@@ -88,6 +100,8 @@ async fn handle(
 
     let mut resp = if echo_body {
         Response::new(Full::new(body.clone()).boxed())
+    } else if let Some(reply) = reply {
+        reply_response(&reply, stream, reply_chunk)
     } else if stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
         tokio::spawn(async move {
@@ -133,6 +147,55 @@ async fn handle(
     resp.headers_mut()
         .insert("x-request-bytes", HeaderValue::from(body.len()));
     Ok(resp)
+}
+
+/// An OpenAI-style answer with the given text, whole or as a stream of deltas.
+/// Each streamed event is sent as two frames, split mid-event, the way TCP
+/// may deliver it.
+fn reply_response(text: &str, stream: bool, chunk: usize) -> Response<BoxBody<Bytes, Infallible>> {
+    if !stream {
+        let completion = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        });
+        let mut resp = Response::new(Full::new(Bytes::from(completion.to_string())).boxed());
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return resp;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut frames: Vec<Bytes> = Vec::new();
+    for piece in chars.chunks(chunk) {
+        let piece: String = piece.iter().collect();
+        let event = serde_json::json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": piece}}],
+        });
+        let event = format!("data: {event}\n\n");
+        let (a, b) = event.split_at(event.len() / 2);
+        frames.push(Bytes::from(a.to_owned()));
+        frames.push(Bytes::from(b.to_owned()));
+    }
+    frames.push(Bytes::from_static(DONE.as_bytes()));
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
+    tokio::spawn(async move {
+        for frame in frames {
+            if tx.send(Ok(Frame::data(frame))).await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut resp = Response::new(BodyExt::boxed(StreamBody::new(ReceiverStream::new(rx))));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    resp
 }
 
 fn is_stream_request(body: &[u8]) -> bool {

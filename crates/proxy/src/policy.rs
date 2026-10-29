@@ -80,7 +80,28 @@ pub struct Route {
     /// Whether the classifier runs while the request is already on its way to
     /// the provider (only the response waits for it), or before forwarding.
     pub classifier_parallel: bool,
+    /// Checks on the provider's response, if the route has any.
+    pub output: Option<Arc<OutputRules>>,
 }
+
+/// The `output` detectors of a route.
+#[derive(Debug)]
+pub struct OutputRules {
+    pub actions: HashMap<Kind, Action>,
+    pub detector: Detector,
+    /// Hosts (and their subdomains) that links and images may point to.
+    pub allow_domains: Vec<String>,
+    /// Words in a row that count as repeating the system prompt, if checked.
+    pub leak_words: Option<usize>,
+    /// Characters of a streamed answer held back so that a value split across
+    /// chunks is still seen whole before it is sent on.
+    pub holdback: usize,
+}
+
+/// Default for `min_words` on `system_prompt_leak`.
+pub const DEFAULT_LEAK_WORDS: usize = 10;
+/// Default for `stream_holdback`.
+pub const DEFAULT_HOLDBACK: usize = 128;
 
 /// Classifier threshold when the policy does not set one.
 pub const DEFAULT_THRESHOLD: f32 = 0.5;
@@ -98,6 +119,12 @@ impl Route {
 
     pub fn inspects_input(&self) -> bool {
         !self.input.is_empty()
+    }
+
+    /// Whether the request body must be read: to inspect it, or to learn the
+    /// system prompt that the leak check compares the answer with.
+    pub fn reads_request(&self) -> bool {
+        self.inspects_input() || self.output.as_ref().is_some_and(|o| o.leak_words.is_some())
     }
 
     /// Threshold and action for the injection classifier, if this route uses it.
@@ -151,6 +178,7 @@ impl Policy {
                 detector: Arc::new(Detector::new()),
                 threshold: None,
                 classifier_parallel: true,
+                output: None,
             }],
         })
     }
@@ -201,7 +229,26 @@ impl Policy {
                 detector,
                 threshold,
                 parallel,
-            } = compile_detectors(&spec.input).with_context(|| format!("route {name:?}"))?;
+                ..
+            } = compile_detectors(&spec.input, Side::Input)
+                .with_context(|| format!("route {name:?} input"))?;
+            let output = if spec.output.is_empty() {
+                ensure!(
+                    spec.stream_holdback.is_none(),
+                    "route {name:?}: stream_holdback needs output detectors"
+                );
+                None
+            } else {
+                let out = compile_detectors(&spec.output, Side::Output)
+                    .with_context(|| format!("route {name:?} output"))?;
+                Some(Arc::new(OutputRules {
+                    actions: out.actions,
+                    detector: out.detector,
+                    allow_domains: out.allow_domains,
+                    leak_words: out.leak_words,
+                    holdback: spec.stream_holdback.unwrap_or(DEFAULT_HOLDBACK),
+                }))
+            };
             routes.push(Route {
                 path_prefix: spec.matcher.path,
                 headers,
@@ -215,6 +262,7 @@ impl Policy {
                 detector: Arc::new(detector),
                 threshold,
                 classifier_parallel: parallel.unwrap_or(true),
+                output,
                 name,
             });
         }
@@ -231,17 +279,54 @@ struct Compiled {
     detector: Detector,
     threshold: Option<f32>,
     parallel: Option<bool>,
+    allow_domains: Vec<String>,
+    leak_words: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Input,
+    Output,
 }
 
 /// Maps each finding kind to the action of the first detector entry that covers
 /// it, and builds the detector with the route's custom patterns and keyword lists.
 /// Also returns the classifier settings, if any are set.
-fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<Compiled> {
+fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compiled> {
     let mut actions = HashMap::new();
     let mut builder = Detector::builder();
     let mut threshold = None;
     let mut parallel = None;
+    let mut allow_domains = Vec::new();
+    let mut leak_words = None;
     for spec in specs {
+        match (spec.detector, side) {
+            (DetectorName::PromptInjection, Side::Output) => {
+                bail!("prompt_injection checks requests; use it under input")
+            }
+            (DetectorName::Exfiltration | DetectorName::SystemPromptLeak, Side::Input) => {
+                bail!("exfiltration and system_prompt_leak check responses; use them under output")
+            }
+            _ => {}
+        }
+        if let Some(domains) = &spec.allow_domains {
+            ensure!(
+                matches!(spec.detector, DetectorName::Exfiltration),
+                "allow_domains is only allowed on the exfiltration detector"
+            );
+            allow_domains.extend(
+                domains
+                    .iter()
+                    .map(|d| d.trim().trim_start_matches("*.").to_ascii_lowercase()),
+            );
+        }
+        if let Some(words) = spec.min_words {
+            ensure!(
+                matches!(spec.detector, DetectorName::SystemPromptLeak),
+                "min_words is only allowed on the system_prompt_leak detector"
+            );
+            ensure!(words >= 4, "min_words must be at least 4");
+        }
         if let Some(p) = spec.parallel {
             ensure!(
                 matches!(spec.detector, DetectorName::PromptInjection),
@@ -264,6 +349,15 @@ fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<Compiled> {
             DetectorName::Pii => Category::Pii,
             DetectorName::Secrets => Category::Secret,
             DetectorName::PromptInjection => Category::Injection,
+            DetectorName::Exfiltration => Category::Exfiltration,
+            DetectorName::SystemPromptLeak => {
+                ensure!(
+                    spec.entities.is_empty(),
+                    "system_prompt_leak has no entities"
+                );
+                leak_words.get_or_insert(spec.min_words.unwrap_or(DEFAULT_LEAK_WORDS));
+                Category::Leak
+            }
             DetectorName::Custom => {
                 let name = spec
                     .name
@@ -315,6 +409,8 @@ fn compile_detectors(specs: &[DetectorFile]) -> anyhow::Result<Compiled> {
         detector: builder.build(),
         threshold,
         parallel,
+        allow_domains,
+        leak_words,
     })
 }
 
@@ -352,6 +448,9 @@ struct RouteFile {
     shadow: Option<bool>,
     #[serde(default)]
     input: Vec<DetectorFile>,
+    #[serde(default)]
+    output: Vec<DetectorFile>,
+    stream_holdback: Option<usize>,
 }
 
 #[derive(Default, Deserialize)]
@@ -379,6 +478,10 @@ struct DetectorFile {
     /// prompt_injection only: run the classifier while the request is forwarded
     /// (default) or before.
     parallel: Option<bool>,
+    /// exfiltration only: domains that links and images may point to.
+    allow_domains: Option<Vec<String>>,
+    /// system_prompt_leak only: words in a row that count as a leak.
+    min_words: Option<usize>,
     action: Action,
 }
 
@@ -388,6 +491,8 @@ enum DetectorName {
     Pii,
     Secrets,
     PromptInjection,
+    Exfiltration,
+    SystemPromptLeak,
     Custom,
 }
 
@@ -474,7 +579,7 @@ routes:
         .contains("unknown entity \"ssn\""));
         // A field from the spec that this version does not support yet.
         assert!(err(&format!(
-            "{base}routes: [{{ name: r, upstream: a, output: [] }}]"
+            "{base}routes: [{{ name: r, upstream: a, tools: [] }}]"
         ))
         .contains("unknown field"));
         assert!(err("version: 2\nupstreams: {}\nroutes: []").contains("unsupported policy version"));

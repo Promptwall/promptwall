@@ -276,6 +276,23 @@ pub(crate) const RULES: &[Spec] = &[
         r"[\x{E0000}-\x{E007F}]{2,}|[\x{202D}\x{202E}]|[\x{200B}-\x{200D}\x{2060}\x{FEFF}]{3,}|[\x{FE00}-\x{FE0F}\x{E0100}-\x{E01EF}]{4,}",
         accept,
     ),
+    // Model output that sends data elsewhere when a client renders it. The value
+    // is the URL; the proxy skips allowed domains.
+    rule(
+        Kind::MarkdownImage,
+        r"!\[[^\]\n]{0,200}\]\(\s*<?(https?://[^\s)>]+)",
+        accept,
+    ),
+    rule(
+        Kind::HtmlImage,
+        r#"(?i)<img\b[^>]{0,300}?\bsrc\s*=\s*["']?(https?://[^\s"'>]+)"#,
+        accept,
+    ),
+    rule(
+        Kind::UrlWithData,
+        r#"https?://[^\s)\]>"'<`]+\?[^\s)\]>"'<`]+"#,
+        valid_url_with_data,
+    ),
 ];
 
 fn accept(s: &str) -> Option<usize> {
@@ -509,6 +526,22 @@ fn valid_secret_value(s: &str) -> Option<usize> {
         .iter()
         .any(|p| lower.contains(p));
     (!placeholder).then_some(s.len())
+}
+
+/// A URL with a query value of 32 or more characters that looks encoded
+/// (base64, hex or percent-encoded), the usual way to smuggle data out.
+fn valid_url_with_data(s: &str) -> Option<usize> {
+    let (_, query) = s.split_once('?')?;
+    query
+        .split(['&', ';'])
+        .filter_map(|pair| pair.split_once('=').map(|(_, v)| v))
+        .any(|v| {
+            v.len() >= 32
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"+/=_-%.".contains(&b))
+                && v.bytes().filter(u8::is_ascii_digit).count() >= 4
+        })
+        .then_some(s.len())
 }
 
 fn digits(s: &str) -> Vec<u32> {

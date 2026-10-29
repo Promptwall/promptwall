@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+futures-util = { version = "0.3", default-features = false }
 clap.workspace = true
 http.workspace = true
 http-body-util.workspace = true
