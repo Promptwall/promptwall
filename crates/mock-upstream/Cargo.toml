@@ -1,0 +1,20 @@
+[package]
+name = "pw-mock-upstream"
+description = "Mock OpenAI-compatible upstream for Promptwall tests and benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
+tokio-stream = "0.1"
