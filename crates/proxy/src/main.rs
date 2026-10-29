@@ -2,13 +2,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-/// Promptwall: open source AI firewall.
+/// Promptwall: open source AI firewall. Without a command, it runs the proxy.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Address to listen on.
     #[arg(long, env = "PROMPTWALL_LISTEN", default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
@@ -16,6 +19,7 @@ struct Args {
     /// Upstream LLM API, e.g. https://api.openai.com. Used when no policy file is given.
     #[arg(
         long,
+        global = true,
         env = "PROMPTWALL_UPSTREAM",
         default_value = "https://api.openai.com"
     )]
@@ -23,59 +27,93 @@ struct Args {
 
     /// Policy file (YAML) with routes, upstreams and detectors. Without one,
     /// every request is forwarded to --upstream uninspected.
-    #[arg(long, env = "PROMPTWALL_POLICY", conflicts_with = "upstream")]
+    #[arg(
+        long,
+        global = true,
+        env = "PROMPTWALL_POLICY",
+        conflicts_with = "upstream"
+    )]
     policy: Option<PathBuf>,
 
     /// Directory with an ONNX prompt-injection classifier (model.onnx,
     /// tokenizer.json, config.json). Without one, the prompt_injection detector
     /// uses its Tier 1 patterns only.
-    #[arg(long, env = "PROMPTWALL_INJECTION_MODEL")]
+    #[arg(long, global = true, env = "PROMPTWALL_INJECTION_MODEL")]
     injection_model: Option<PathBuf>,
 
     /// Directory with an ONNX moderation model for the content_safety detector,
     /// such as a content-safety guard (an `unsafe` label plus harm categories)
     /// or a toxicity model. An optional thresholds.json sets per-category
     /// thresholds.
-    #[arg(long, env = "PROMPTWALL_SAFETY_MODEL")]
+    #[arg(long, global = true, env = "PROMPTWALL_SAFETY_MODEL")]
     safety_model: Option<PathBuf>,
 
     /// Directory with an ONNX zero-shot (NLI) model for the topics detector.
-    #[arg(long, env = "PROMPTWALL_TOPIC_MODEL")]
+    #[arg(long, global = true, env = "PROMPTWALL_TOPIC_MODEL")]
     topic_model: Option<PathBuf>,
 
     /// Directory with an ONNX token-classification (NER) model that finds
     /// names, addresses and other personal data without a fixed pattern. Its
     /// entity types (B-PERSON becomes `person`) can then be listed under the
     /// pii detector.
-    #[arg(long, env = "PROMPTWALL_PII_MODEL")]
+    #[arg(long, global = true, env = "PROMPTWALL_PII_MODEL")]
     pii_model: Option<PathBuf>,
 
     /// Classifier sessions that run in parallel (each holds a copy of the model).
     /// Defaults to the number of CPUs, at most 4.
-    #[arg(long, env = "PROMPTWALL_MODEL_SESSIONS")]
+    #[arg(long, global = true, env = "PROMPTWALL_MODEL_SESSIONS")]
     model_sessions: Option<usize>,
 
     /// Threads each classifier session may use for one inference (default 1).
     /// More threads make each check faster; more sessions let more checks run
     /// at the same time.
-    #[arg(long, env = "PROMPTWALL_MODEL_THREADS")]
+    #[arg(long, global = true, env = "PROMPTWALL_MODEL_THREADS")]
     model_threads: Option<usize>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check the policy file and that the models it needs are loaded.
+    Validate,
+    /// Run the test cases in the policy's `tests` section.
+    Test,
+    /// Show what a route does with one prompt (or, with --output, an answer).
+    Scan {
+        /// The route whose checks apply.
+        #[arg(long)]
+        route: String,
+        /// Check the text as the provider's answer instead of a prompt.
+        #[arg(long)]
+        output: bool,
+        /// The text to check.
+        text: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    // Commands other than the proxy print their own results.
+    let default_filter = if args.command.is_some() {
+        "warn,ort=warn"
+    } else {
+        "info,ort=warn"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into()),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter.into()),
         )
+        .with_writer(std::io::stderr)
         .init();
+    if args.command.is_some() && args.policy.is_none() {
+        anyhow::bail!("this command needs a policy file (--policy)");
+    }
 
-    let args = Args::parse();
     let policy = match &args.policy {
         Some(path) => promptwall::Policy::load(path)?,
         None => promptwall::Policy::passthrough(&args.upstream)?,
     };
-    let routes: Vec<&str> = policy.routes.iter().map(|r| r.name.as_str()).collect();
+    let routes: Vec<String> = policy.routes.iter().map(|r| r.name.clone()).collect();
     tracing::info!(?routes, policy = ?args.policy, "policy loaded");
     let mut options = promptwall_classify::Options::default();
     if let Some(n) = args.model_sessions {
@@ -131,6 +169,49 @@ async fn main() -> anyhow::Result<()> {
         models.pii = Some(Arc::new(model));
     }
     let proxy = promptwall::Proxy::with_models(policy, models)?;
+    match args.command {
+        None => {}
+        Some(Command::Validate) => {
+            println!("policy is valid: {}", routes.join(", "));
+            return Ok(());
+        }
+        Some(Command::Test) => {
+            let results = proxy.run_tests();
+            let failed = results.iter().filter(|r| r.failure.is_some()).count();
+            for result in &results {
+                match &result.failure {
+                    None => println!("ok    {}", result.name),
+                    Some(why) => println!("FAIL  {}\n      {why}", result.name),
+                }
+            }
+            println!("{} passed, {failed} failed", results.len() - failed);
+            if failed > 0 {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(Command::Scan {
+            route,
+            output,
+            text,
+        }) => {
+            let sample = if output {
+                promptwall::Sample::Output(&text)
+            } else {
+                promptwall::Sample::Input(&text)
+            };
+            let verdict = proxy.check(&route, sample)?;
+            println!(
+                "action: {}",
+                verdict.action.map_or("allow", promptwall::Action::as_str)
+            );
+            for (label, n) in &verdict.findings {
+                println!("finding: {label} ({n})");
+            }
+            println!("text: {}", verdict.text);
+            return Ok(());
+        }
+    }
     let (listener, addr) = promptwall::bind(args.listen).await?;
     tracing::info!(%addr, "promptwall listening");
 

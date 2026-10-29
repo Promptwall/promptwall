@@ -39,6 +39,32 @@ impl Action {
     }
 }
 
+/// The action of a detector entry: an [`Action`], or `allow`, which exempts
+/// the entry's entities from later entries.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RuleAction {
+    Allow,
+    Flag,
+    Redact,
+    Block,
+}
+
+impl RuleAction {
+    fn action(self) -> Option<Action> {
+        match self {
+            RuleAction::Allow => None,
+            RuleAction::Flag => Some(Action::Flag),
+            RuleAction::Redact => Some(Action::Redact),
+            RuleAction::Block => Some(Action::Block),
+        }
+    }
+}
+
+/// Values that are not findings, per kind: case-insensitive patterns where
+/// `*` stands for any run of characters, such as `*@example.com`.
+pub type Except = HashMap<Kind, Vec<String>>;
+
 /// What happens when a request cannot be inspected (too large, compressed, not text).
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +80,24 @@ pub enum FailMode {
 #[derive(Debug)]
 pub struct Policy {
     pub routes: Vec<Route>,
+    /// Test cases from the policy file, run with `promptwall test`.
+    pub tests: Vec<PolicyTest>,
+}
+
+/// A prompt or answer and what its route is expected to do with it.
+#[derive(Clone, Debug)]
+pub struct PolicyTest {
+    pub name: String,
+    pub route: String,
+    /// The text, and whether it is an answer (`output`) rather than a prompt.
+    pub text: String,
+    pub output: bool,
+    /// `None` means nothing is found.
+    pub action: Option<Action>,
+    /// Finding labels that must be among the findings, such as `pii.email`.
+    pub findings: Vec<String>,
+    /// The text as it must be sent on, with redactions.
+    pub expect_text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -74,6 +118,8 @@ pub struct Route {
     /// Action per finding kind on the request. Empty means the request body is
     /// streamed through without inspection.
     pub input: HashMap<Kind, Action>,
+    /// Values on the request that are not findings.
+    pub except: Except,
     /// Built-in detectors plus this route's custom patterns and keyword lists.
     pub detector: Arc<Detector>,
     /// Classifier score at or above which a prompt counts as an injection, if
@@ -97,8 +143,16 @@ pub struct Route {
 /// The `pii` entities that a Tier 2 token-classification model finds.
 #[derive(Clone, Debug, Default)]
 pub struct PiiRule {
-    /// Action and threshold per lower-case entity name, such as `person`.
-    pub entities: BTreeMap<String, (Action, f32)>,
+    /// Lower-case entity name, such as `person`, and what applies to it.
+    pub entities: BTreeMap<String, ModelEntity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelEntity {
+    pub action: Action,
+    pub threshold: f32,
+    /// Values that are not findings, as in [`Except`].
+    pub except: Vec<String>,
 }
 
 /// A `content_safety` entry.
@@ -124,6 +178,8 @@ pub struct TopicRule {
 #[derive(Debug)]
 pub struct OutputRules {
     pub actions: HashMap<Kind, Action>,
+    /// Values in the answer that are not findings.
+    pub except: Except,
     pub detector: Detector,
     /// Hosts (and their subdomains) that links and images may point to.
     pub allow_domains: Vec<String>,
@@ -224,6 +280,7 @@ impl Policy {
                 fail_mode: FailMode::Open,
                 shadow: false,
                 input: HashMap::new(),
+                except: Except::new(),
                 detector: Arc::new(Detector::new()),
                 threshold: None,
                 classifier_parallel: true,
@@ -233,6 +290,7 @@ impl Policy {
                 topics: None,
                 pii: None,
             }],
+            tests: Vec::new(),
         })
     }
 
@@ -279,6 +337,7 @@ impl Policy {
                 .collect::<anyhow::Result<_>>()?;
             let Compiled {
                 actions: input,
+                except,
                 detector,
                 threshold,
                 parallel,
@@ -304,6 +363,7 @@ impl Policy {
                 tools.as_ref().map(|_| {
                     Arc::new(OutputRules {
                         actions: HashMap::new(),
+                        except: Except::new(),
                         detector: Detector::new(),
                         allow_domains: Vec::new(),
                         leak_words: None,
@@ -317,6 +377,7 @@ impl Policy {
                     .with_context(|| format!("route {name:?} output"))?;
                 Some(Arc::new(OutputRules {
                     actions: out.actions,
+                    except: out.except,
                     detector: out.detector,
                     allow_domains: out.allow_domains,
                     leak_words: out.leak_words,
@@ -335,6 +396,7 @@ impl Policy {
                     .unwrap_or_default(),
                 shadow: spec.shadow.or(file.defaults.shadow).unwrap_or(false),
                 input,
+                except,
                 detector: Arc::new(detector),
                 threshold,
                 classifier_parallel: parallel.unwrap_or(true),
@@ -346,7 +408,42 @@ impl Policy {
                 name,
             });
         }
-        Ok(Self { routes })
+        let tests = file
+            .tests
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let (text, output) = match (t.input, t.output) {
+                    (Some(text), None) => (text, false),
+                    (None, Some(text)) => (text, true),
+                    _ => bail!("test {}: set either input or output", i + 1),
+                };
+                ensure!(
+                    routes.iter().any(|r: &Route| r.name == t.route),
+                    "test {}: unknown route {:?}",
+                    i + 1,
+                    t.route
+                );
+                let (action, findings, expect_text) = match t.expect {
+                    ExpectFile::Action(action) => (action, Vec::new(), None),
+                    ExpectFile::Detail(d) => (d.action, d.findings, d.text),
+                };
+                let name = t.name.unwrap_or_else(|| {
+                    let short: String = text.chars().take(40).collect();
+                    format!("{}: {short}", t.route)
+                });
+                Ok(PolicyTest {
+                    name,
+                    route: t.route,
+                    text,
+                    output,
+                    action: action.action(),
+                    findings,
+                    expect_text,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        Ok(Self { routes, tests })
     }
 
     pub fn route(&self, path: &str, headers: &HeaderMap) -> Option<&Route> {
@@ -356,6 +453,7 @@ impl Policy {
 
 struct Compiled {
     actions: HashMap<Kind, Action>,
+    except: Except,
     detector: Detector,
     threshold: Option<f32>,
     parallel: Option<bool>,
@@ -376,7 +474,10 @@ enum Side {
 /// it, and builds the detector with the route's custom patterns and keyword lists.
 /// Also returns the classifier settings, if any are set.
 fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compiled> {
-    let mut actions = HashMap::new();
+    // `None` for kinds an `allow` entry exempts.
+    let mut actions: HashMap<Kind, Option<Action>> = HashMap::new();
+    let mut except = Except::new();
+    let mut model_entities: BTreeMap<String, Option<ModelEntity>> = BTreeMap::new();
     let mut builder = Detector::builder();
     let mut threshold = None;
     let mut parallel = None;
@@ -384,8 +485,22 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
     let mut leak_words = None;
     let mut safety = None;
     let mut topics = None;
-    let mut pii = PiiRule::default();
     for spec in specs {
+        let action = spec.action.action();
+        if !spec.except.is_empty() {
+            ensure!(action.is_some(), "except is meaningless with action: allow");
+            ensure!(
+                matches!(
+                    spec.detector,
+                    DetectorName::Pii
+                        | DetectorName::Secrets
+                        | DetectorName::Custom
+                        | DetectorName::PromptInjection
+                        | DetectorName::Exfiltration
+                ),
+                "except is only allowed on the pii, secrets, custom, prompt_injection and exfiltration detectors"
+            );
+        }
         match (spec.detector, side) {
             (DetectorName::PromptInjection, Side::Output) => {
                 bail!("prompt_injection checks requests; use it under input")
@@ -443,9 +558,17 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         );
         // Model-based content checks: one entry each, without finding kinds.
         // The classifier cannot point at a span, so redact blocks.
-        let model_action = match spec.action {
-            Action::Redact => Action::Block,
-            action => action,
+        let model_action = match action {
+            Some(Action::Redact) => Action::Block,
+            Some(action) => action,
+            None if matches!(
+                spec.detector,
+                DetectorName::ContentSafety | DetectorName::Topics
+            ) =>
+            {
+                bail!("action: allow is not available on content_safety and topics; leave the entry out instead")
+            }
+            None => Action::Flag, // unused
         };
         match spec.detector {
             DetectorName::ContentSafety => {
@@ -497,7 +620,9 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
                     spec.entities.is_empty(),
                     "system_prompt_leak has no entities"
                 );
-                leak_words.get_or_insert(spec.min_words.unwrap_or(DEFAULT_LEAK_WORDS));
+                if action.is_some() {
+                    leak_words.get_or_insert(spec.min_words.unwrap_or(DEFAULT_LEAK_WORDS));
+                }
                 Category::Leak
             }
             DetectorName::Custom => {
@@ -514,7 +639,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
                     (None, Some(words)) => builder.keywords(name, words)?,
                     _ => bail!("custom detector {name:?} needs either pattern or keywords"),
                 };
-                actions.entry(kind).or_insert(spec.action);
+                claim(&mut actions, &mut except, kind, action, &spec.except);
                 continue;
             }
         };
@@ -524,7 +649,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         );
         // PII entities that are not built in are left to the PII model, which
         // `Proxy::with_models` checks them against.
-        let mut model_entities = Vec::new();
+        let mut model_names = Vec::new();
         let kinds: Vec<Kind> = if spec.entities.is_empty() {
             Kind::ALL
                 .into_iter()
@@ -539,7 +664,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
                         && !e.is_empty()
                         && e.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') =>
                     {
-                        model_entities.push(e.clone())
+                        model_names.push(e.clone())
                     }
                     None => {
                         let known: Vec<_> = Kind::ALL
@@ -555,22 +680,35 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
         };
         if spec.threshold.is_some() && category == Category::Pii {
             ensure!(
-                !model_entities.is_empty(),
+                !model_names.is_empty(),
                 "threshold on pii applies to entities found by the PII model, such as person; this entry lists none"
             );
         }
-        let threshold_here = spec.threshold.unwrap_or(crate::ner::DEFAULT_THRESHOLD);
-        for e in model_entities {
-            pii.entities
+        for e in model_names {
+            model_entities
                 .entry(e)
-                .or_insert((spec.action, threshold_here));
+                .or_insert(action.map(|action| ModelEntity {
+                    action,
+                    threshold: spec.threshold.unwrap_or(crate::ner::DEFAULT_THRESHOLD),
+                    except: spec.except.clone(),
+                }));
         }
         for kind in kinds {
-            actions.entry(kind).or_insert(spec.action);
+            claim(&mut actions, &mut except, kind, action, &spec.except);
         }
     }
+    let pii = PiiRule {
+        entities: model_entities
+            .into_iter()
+            .filter_map(|(name, e)| Some((name, e?)))
+            .collect(),
+    };
     Ok(Compiled {
-        actions,
+        actions: actions
+            .into_iter()
+            .filter_map(|(kind, action)| Some((kind, action?)))
+            .collect(),
+        except,
         detector: builder.build(),
         threshold,
         parallel,
@@ -582,6 +720,22 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
     })
 }
 
+/// Gives `kind` the action of this entry, unless an earlier entry has it.
+fn claim(
+    actions: &mut HashMap<Kind, Option<Action>>,
+    except: &mut Except,
+    kind: Kind,
+    action: Option<Action>,
+    values: &[String],
+) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = actions.entry(kind) {
+        slot.insert(action);
+        if !values.is_empty() {
+            except.insert(kind, values.to_vec());
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
@@ -590,6 +744,36 @@ struct PolicyFile {
     defaults: DefaultsFile,
     upstreams: BTreeMap<String, UpstreamFile>,
     routes: Vec<RouteFile>,
+    #[serde(default)]
+    tests: Vec<TestFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestFile {
+    name: Option<String>,
+    route: String,
+    input: Option<String>,
+    output: Option<String>,
+    expect: ExpectFile,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExpectFile {
+    /// `expect: block`
+    Action(RuleAction),
+    /// `expect: { action: redact, findings: [pii.email], text: "..." }`
+    Detail(ExpectDetail),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectDetail {
+    action: RuleAction,
+    #[serde(default)]
+    findings: Vec<String>,
+    text: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -725,7 +909,10 @@ struct DetectorFile {
     /// topics only: the topics a request must be about.
     #[serde(default)]
     allow: Vec<String>,
-    action: Action,
+    /// Values that are not findings, such as the company's own support address.
+    #[serde(default)]
+    except: Vec<String>,
+    action: RuleAction,
 }
 
 #[derive(Clone, Copy, Deserialize)]

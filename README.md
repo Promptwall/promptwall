@@ -30,6 +30,14 @@ cargo run --release -p promptwall -- --policy examples/policy.yaml
 
 With [`examples/policy.yaml`](examples/policy.yaml), a prompt containing an API key or private key is rejected with `403`, prompt-injection phrasing ("ignore all previous instructions", also as base64, leetspeak or look-alike letters; hidden Unicode, forged chat tokens) is blocked, and emails, IBANs, card numbers, national IDs and company-specific patterns are replaced with markers such as `[REDACTED:EMAIL]` before the request reaches the provider. The response header `x-promptwall-action` says what happened. Logs record which kinds were found, never the values.
 
+To check a policy without running the proxy:
+
+```sh
+cargo run --release -p promptwall -- validate --policy examples/policy.yaml
+cargo run --release -p promptwall -- test --policy examples/policy.yaml    # the tests in the file
+cargo run --release -p promptwall -- scan --policy examples/policy.yaml --route openai "mail jane@corp.io"
+```
+
 To measure the latency the proxy adds:
 
 ```sh

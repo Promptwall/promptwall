@@ -35,8 +35,9 @@ use promptwall_classify::Classifier;
 use promptwall_detect::{Kind, SystemPromptIndex};
 use tokio::net::TcpListener;
 
+pub use policy::Action;
+use policy::FailMode;
 pub use policy::Policy;
-use policy::{Action, FailMode};
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
@@ -278,6 +279,7 @@ impl Proxy {
                     untrusted: !jobs.is_empty() || output_safety.is_some(),
                     trusted: leak_words.is_some(),
                 },
+                &route.except,
             )
         };
         let mut outcome = match outcome {
@@ -322,15 +324,7 @@ impl Proxy {
                     .unwrap_or_else(|| body.clone());
                 let task = tokio::task::spawn_blocking(move || tag_body(&model, &rule, &current));
                 match task.await {
-                    Ok(Ok((tagged, new_body))) => {
-                        for (label, n) in tagged.findings {
-                            *outcome.findings.entry(label).or_default() += n;
-                        }
-                        outcome.action = outcome.action.max(tagged.action);
-                        if new_body.is_some() {
-                            outcome.redacted_body = new_body;
-                        }
-                    }
+                    Ok(Ok((tagged, new_body))) => add_tagged(&mut outcome, tagged, new_body),
                     Ok(Err(err)) => {
                         tracing::warn!(route = %route.name, error = %format!("{err:#}"), "PII model failed");
                         return Ok(self.uninspected(route, parts, body).await);
@@ -472,6 +466,141 @@ impl Proxy {
         }
     }
 
+    /// Runs a route's checks on one prompt or answer without sending
+    /// anything, for policy tests and `promptwall scan`. A prompt is checked
+    /// as the user message of a chat request. Blocking: the models run inline.
+    pub fn check(&self, route: &str, sample: Sample) -> anyhow::Result<Verdict> {
+        let route = self
+            .inner
+            .policy
+            .routes
+            .iter()
+            .find(|r| r.name == route)
+            .with_context(|| format!("no route named {route:?}"))?;
+        let models = &self.inner.models;
+        let text = match sample {
+            Sample::Input(text) => text,
+            Sample::Output(text) => {
+                let Some(rules) = &route.output else {
+                    return Ok(Verdict {
+                        text: text.to_owned(),
+                        ..Verdict::default()
+                    });
+                };
+                let check = output::OutputCheck {
+                    route: route.name.clone(),
+                    rules: rules.clone(),
+                    shadow: false,
+                    fail_closed: route.fail_mode == FailMode::Closed,
+                    system: None,
+                    tools: None,
+                    safety: rules.safety.clone().zip(models.safety.clone()),
+                    pii: rules.pii.clone().zip(models.pii.clone()),
+                    prompt: String::new(),
+                };
+                return output::check_text(&check, text);
+            }
+        };
+        let body = serde_json::json!({"messages": [{"role": "user", "content": text}]});
+        let body = Bytes::from(body.to_string());
+        let collect = inspect::Collect {
+            untrusted: true,
+            trusted: false,
+        };
+        let mut outcome =
+            inspect::inspect(&route.detector, &route.input, &body, collect, &route.except)
+                .map_err(|_| anyhow::anyhow!("the text could not be inspected"))?;
+        if outcome.action != Some(Action::Block) {
+            if let Some((rule, model)) = route.pii.as_ref().zip(models.pii.as_ref()) {
+                let current = outcome
+                    .redacted_body
+                    .clone()
+                    .unwrap_or_else(|| body.clone());
+                let (tagged, new_body) = tag_body(model, rule, &current)?;
+                add_tagged(&mut outcome, tagged, new_body);
+            }
+        }
+        let jobs = Tier2 {
+            injection: route.classifier().zip(models.injection.clone()),
+            safety: route.safety.clone().zip(models.safety.clone()),
+            topics: route.topics.clone().zip(models.topics.clone()),
+        };
+        if !jobs.is_empty() && outcome.action != Some(Action::Block) {
+            let (found, _) = jobs.run(&outcome.untrusted_text)?;
+            add_model_findings(&mut outcome, &found);
+        }
+        let text = match (&outcome.redacted_body, outcome.action) {
+            (Some(body), Some(Action::Redact)) => {
+                serde_json::from_slice::<serde_json::Value>(body)?["messages"][0]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            }
+            _ => text.to_owned(),
+        };
+        Ok(Verdict {
+            action: outcome.action,
+            findings: outcome.findings,
+            text,
+        })
+    }
+
+    /// Runs the test cases of the policy (its `tests` section). Blocking,
+    /// like [`Proxy::check`].
+    pub fn run_tests(&self) -> Vec<TestResult> {
+        self.inner
+            .policy
+            .tests
+            .iter()
+            .map(|test| {
+                let sample = if test.output {
+                    Sample::Output(&test.text)
+                } else {
+                    Sample::Input(&test.text)
+                };
+                let failure = match self.check(&test.route, sample) {
+                    Err(err) => Some(format!("{err:#}")),
+                    Ok(verdict) => {
+                        let name = |a: Option<Action>| a.map_or("allow", Action::as_str);
+                        let mut problems = Vec::new();
+                        if verdict.action != test.action {
+                            problems.push(format!(
+                                "expected {}, got {}",
+                                name(test.action),
+                                name(verdict.action)
+                            ));
+                        }
+                        let missing: Vec<&str> = test
+                            .findings
+                            .iter()
+                            .filter(|f| !verdict.findings.contains_key(*f))
+                            .map(String::as_str)
+                            .collect();
+                        if !missing.is_empty() {
+                            problems.push(format!("missing findings {}", missing.join(", ")));
+                        }
+                        if let Some(text) =
+                            test.expect_text.as_ref().filter(|t| **t != verdict.text)
+                        {
+                            problems
+                                .push(format!("expected text {text:?}, got {:?}", verdict.text));
+                        }
+                        if !problems.is_empty() && !verdict.findings.is_empty() {
+                            let found: Vec<&str> =
+                                verdict.findings.keys().map(String::as_str).collect();
+                            problems.push(format!("found {}", found.join(", ")));
+                        }
+                        (!problems.is_empty()).then(|| problems.join("; "))
+                    }
+                };
+                TestResult {
+                    name: test.name.clone(),
+                    failure,
+                }
+            })
+            .collect()
+    }
+
     /// Accepts connections on `listener` until `shutdown` resolves.
     pub async fn serve(
         self,
@@ -560,6 +689,43 @@ pub struct Models {
     /// Token-classification model for `pii` entities that are not built in,
     /// such as names and addresses.
     pub pii: Option<Arc<ner::PiiModel>>,
+}
+
+/// The outcome of one policy test.
+#[derive(Debug)]
+pub struct TestResult {
+    pub name: String,
+    /// Why it failed; `None` if it passed.
+    pub failure: Option<String>,
+}
+
+/// A prompt or an answer to check with [`Proxy::check`].
+#[derive(Clone, Copy, Debug)]
+pub enum Sample<'a> {
+    Input(&'a str),
+    Output(&'a str),
+}
+
+/// What a route does with one prompt or answer.
+#[derive(Debug, Default)]
+pub struct Verdict {
+    /// The most severe action, if anything was found.
+    pub action: Option<Action>,
+    /// Finding labels and how often each was found.
+    pub findings: std::collections::BTreeMap<String, usize>,
+    /// The text as it would be sent on, with redactions.
+    pub text: String,
+}
+
+/// Adds what the PII model found to the outcome of Tier 1.
+fn add_tagged(outcome: &mut inspect::Outcome, tagged: ner::Tagged, new_body: Option<Bytes>) {
+    for (label, n) in tagged.findings {
+        *outcome.findings.entry(label).or_default() += n;
+    }
+    outcome.action = outcome.action.max(tagged.action);
+    if new_body.is_some() {
+        outcome.redacted_body = new_body;
+    }
 }
 
 /// Tags the prompt text of a request body with the PII model; returns what it

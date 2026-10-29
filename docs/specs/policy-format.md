@@ -16,11 +16,32 @@
 | `routes[].tools` with `allow`, `deny`, `arguments` (`tool`, `field`, `allow`, `deny`, `allow_domains`), `action: block \| flag` | Yes |
 | `routes[].input` with `detector: content_safety` (`entities`, `threshold`) or `detector: topics` (`deny`, `allow`, `threshold`); `routes[].output` with `detector: content_safety` | Yes, with `--safety-model` / `--topic-model` |
 | `detector: pii` with model entities (`person`, `street_address`, ...) and `threshold`, on input and output | Yes, with `--pii-model` |
-| `mode: indirect`, `untrusted_content`, `rules`, `limits`, `tests` | Not yet |
+| `except` on `pii`, `secrets`, `custom`, `prompt_injection` and `exfiltration` entries; `action: allow` | Yes |
+| `tests` (`route`, `input` or `output`, `expect`), `promptwall validate`, `test` and `scan` | Yes |
+| `mode: indirect`, `untrusted_content`, `rules`, `limits`, `action: rewrite` | Not yet |
 
 Fields that are not implemented yet are **rejected** when the policy loads, so an unsupported rule never silently does nothing. Requests that match no route get `404`.
 
 Entity names. An empty `entities` list means all entities of that detector. When several entries cover the same entity, the first one wins.
+
+## Exceptions and allow entries
+
+Every rule can be narrowed or switched off. Detectors you do not list do not run, an entry can name only some `entities`, and `shadow: true` only logs. Two more tools:
+
+```yaml
+input:
+  - detector: pii
+    entities: [email]
+    except: ['*@example.com', 'help@partner.io']   # these values are not findings
+    action: redact
+  - detector: pii
+    entities: [ip_address]
+    action: allow        # exempt IP addresses from the entries below
+  - detector: pii
+    action: flag
+```
+
+`except` lists values that are not findings, as case-insensitive patterns where `*` stands for any text. It applies to the entities of its entry, on `pii` (built-in and model entities), `secrets`, `custom`, `prompt_injection` and `exfiltration` entries. `action: allow` claims its entities so that later entries do not apply to them; it is not available on `content_safety` and `topics`, which are simply left out instead.
 
 | Detector | Entity | How it is matched |
 | --- | --- | --- |
@@ -271,10 +292,24 @@ tests:
     expect: block
   - route: support-bot
     input: "My email is jane@example.com, can you help?"
-    expect: { action: redact, entities: [email] }
+    expect:
+      action: redact               # allow (nothing found), flag, redact or block
+      findings: [pii.email]        # must be among the findings
+      text: "My email is [REDACTED:EMAIL], can you help?"   # as it is sent on
+  - route: support-bot
+    output: "Your key is AKIAIOSFODNN7EXAMPLE"   # an answer instead of a prompt
+    expect: block
 ```
 
-`promptwall policy test` runs them locally and in CI.
+`input` is checked as the user message of a chat request, `output` as the provider's answer, with the route's detectors and the models given on the command line. `name` is optional.
+
+```sh
+promptwall validate --policy policy.yaml          # checks the file and the models it needs
+promptwall test --policy policy.yaml              # runs the tests; exits 1 if one fails
+promptwall scan --policy policy.yaml --route support-bot "text to check"   # --output for an answer
+```
+
+The model flags (`--pii-model` and the others) work with every command. `examples/policy.yaml` has tests, and CI runs them.
 
 ## Open questions
 
