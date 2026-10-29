@@ -22,7 +22,13 @@ cargo run --release -p promptwall -- --listen 127.0.0.1:8080 --upstream https://
 
 Then point your OpenAI client at `http://127.0.0.1:8080/v1`. Requests and streamed responses pass through unchanged; `GET /healthz` answers locally.
 
-To inspect requests, start it with a policy instead:
+To inspect requests, start it with a policy. `promptwall init` asks a few questions (provider, what to block or redact, limits) and writes one for you:
+
+```sh
+cargo run --release -p promptwall -- init my-policy.yaml
+```
+
+Or start from the example policy:
 
 ```sh
 cargo run --release -p promptwall -- --policy examples/policy.yaml
