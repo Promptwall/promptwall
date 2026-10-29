@@ -1,0 +1,8 @@
+{
+  "problem_type": "multi_label_classification",
+  "id2label": {
+    "0": "other",
+    "1": "unsafe"
+  },
+  "max_position_embeddings": 16
+}

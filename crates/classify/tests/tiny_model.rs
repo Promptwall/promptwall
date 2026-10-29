@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use promptwall_classify::{Classifier, Options};
+use promptwall_classify::{Classifier, Options, Pair};
 
 fn tiny(options: Options) -> Classifier {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
@@ -55,4 +55,55 @@ fn caps_the_windows_it_scores_to_the_end_of_the_text() {
 fn rejects_a_directory_without_a_model() {
     let err = Classifier::load(Path::new("/nonexistent"), &Options::default()).unwrap_err();
     assert!(format!("{err:#}").contains("tokenizer.json"));
+}
+
+fn fixture(name: &str) -> Classifier {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    Classifier::load(&dir, &Options::default()).unwrap()
+}
+
+#[test]
+fn multi_label_models_score_each_label_on_its_own() {
+    let model = fixture("tiny-safety");
+    assert_eq!(model.labels(), ["other", "unsafe"]);
+    let scores = model
+        .scores("please attack the report", Pair::None)
+        .unwrap();
+    // Sigmoids, not a softmax: the constant label stays at 0.5.
+    assert!(
+        (scores[0] - 0.5).abs() < 1e-6 && scores[1] > 0.95,
+        "{scores:?}"
+    );
+}
+
+#[test]
+fn scores_a_text_together_with_a_second_one() {
+    let model = fixture("tiny-nli");
+    let entail = |text: &str, pair| model.scores(text, pair).unwrap()[1];
+    assert!(
+        entail(
+            "please summarise the report",
+            Pair::After("this is about attack")
+        ) > 0.95
+    );
+    assert!(entail("please summarise the report", Pair::Before("attack")) > 0.95);
+    assert!(
+        entail(
+            "please summarise the report",
+            Pair::After("this is about the weather")
+        ) < 0.05
+    );
+    // One batch for several hypotheses, in order.
+    let each = model
+        .scores_each("hello", &[Pair::After("attack"), Pair::After("report")])
+        .unwrap();
+    assert!(each[0][1] > 0.95 && each[1][1] < 0.05);
+    // Long texts are windowed; the hypothesis is in every window.
+    let long = format!(
+        "{} attack",
+        "hello please summarise this report ".repeat(30)
+    );
+    assert!(entail(&long, Pair::After("report")) > 0.95);
 }

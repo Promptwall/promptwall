@@ -6,6 +6,7 @@
 //! Responses are always streamed back without buffering.
 
 pub mod inspect;
+pub mod moderation;
 pub mod output;
 pub mod policy;
 pub mod tools;
@@ -65,7 +66,7 @@ pub struct Proxy {
 
 struct Inner {
     policy: Policy,
-    classifier: Option<Arc<Classifier>>,
+    models: Models,
     client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
 }
 
@@ -77,7 +78,7 @@ impl Proxy {
     }
 
     pub fn with_policy(policy: Policy) -> anyhow::Result<Self> {
-        Self::with_classifier(policy, None)
+        Self::with_models(policy, Models::default())
     }
 
     /// Like [`Proxy::with_policy`], with the Tier 2 prompt-injection classifier.
@@ -86,11 +87,47 @@ impl Proxy {
         policy: Policy,
         classifier: Option<Arc<Classifier>>,
     ) -> anyhow::Result<Self> {
-        if classifier.is_none() {
-            if let Some(route) = policy.routes.iter().find(|r| r.threshold.is_some()) {
+        Self::with_models(
+            policy,
+            Models {
+                injection: classifier,
+                ..Models::default()
+            },
+        )
+    }
+
+    /// Like [`Proxy::with_policy`], with Tier 2 models. Fails when a route
+    /// needs a model that is not loaded.
+    pub fn with_models(policy: Policy, models: Models) -> anyhow::Result<Self> {
+        for route in &policy.routes {
+            let name = &route.name;
+            if models.injection.is_none() && route.threshold.is_some() {
                 anyhow::bail!(
-                    "route {:?} sets a prompt_injection threshold, but no injection model is loaded (--injection-model)",
-                    route.name
+                    "route {name:?} sets a prompt_injection threshold, but no injection model is loaded (--injection-model)"
+                );
+            }
+            let output_safety = route.output.as_ref().and_then(|o| o.safety.as_ref());
+            for rule in route.safety.iter().chain(output_safety) {
+                let Some(model) = &models.safety else {
+                    anyhow::bail!(
+                        "route {name:?} uses content_safety, but no safety model is loaded (--safety-model)"
+                    );
+                };
+                let known: Vec<&str> = model.categories().collect();
+                if let Some(unknown) = rule
+                    .categories
+                    .iter()
+                    .find(|c| !known.contains(&c.as_str()))
+                {
+                    anyhow::bail!(
+                        "route {name:?}: the safety model has no category {unknown:?}; it has {}",
+                        known.join(", ")
+                    );
+                }
+            }
+            if route.topics.is_some() && models.topics.is_none() {
+                anyhow::bail!(
+                    "route {name:?} uses topics, but no topic model is loaded (--topic-model)"
                 );
             }
         }
@@ -112,7 +149,7 @@ impl Proxy {
         Ok(Self {
             inner: Arc::new(Inner {
                 policy,
-                classifier,
+                models,
                 client,
             }),
         })
@@ -167,6 +204,8 @@ impl Proxy {
                 fail_closed: route.fail_mode == FailMode::Closed,
                 system: None,
                 tools: route.tools.clone(),
+                safety: rules.safety.clone().zip(self.inner.models.safety.clone()),
+                prompt: String::new(),
             }));
         }
 
@@ -192,9 +231,14 @@ impl Proxy {
             }
         };
 
-        let classifier = route.classifier().zip(self.inner.classifier.clone());
+        let models = &self.inner.models;
+        let jobs = Tier2 {
+            injection: route.classifier().zip(models.injection.clone()),
+            safety: route.safety.clone().zip(models.safety.clone()),
+            topics: route.topics.clone().zip(models.topics.clone()),
+        };
+        let output_safety = route.output.as_ref().and_then(|o| o.safety.clone());
         let leak_words = route.output.as_ref().and_then(|o| o.leak_words);
-        let leak_check = leak_words.is_some();
         let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
             Err(inspect::Unscannable)
         } else {
@@ -203,8 +247,8 @@ impl Proxy {
                 &route.input,
                 &body,
                 inspect::Collect {
-                    untrusted: classifier.is_some(),
-                    trusted: leak_check,
+                    untrusted: !jobs.is_empty() || output_safety.is_some(),
+                    trusted: leak_words.is_some(),
                 },
             )
         };
@@ -213,15 +257,23 @@ impl Proxy {
                 if let Some(rules) = &route.tools {
                     check_offered_tools(rules, &body, &mut outcome);
                 }
-                if let (Some(words), Some(rules)) = (leak_words, &route.output) {
+                if let Some(rules) = route
+                    .output
+                    .as_ref()
+                    .filter(|_| leak_words.is_some() || output_safety.is_some())
+                {
+                    // The answer is checked against this request's system prompt
+                    // and judged together with its prompt.
                     let system = std::mem::take(&mut outcome.trusted_text);
                     parts.extensions.insert(Arc::new(output::OutputCheck {
                         route: route.name.clone(),
                         rules: rules.clone(),
                         shadow: route.shadow,
                         fail_closed: route.fail_mode == FailMode::Closed,
-                        system: Some(SystemPromptIndex::new(&system, words)),
+                        system: leak_words.map(|words| SystemPromptIndex::new(&system, words)),
                         tools: route.tools.clone(),
+                        safety: output_safety.zip(models.safety.clone()),
+                        prompt: last_chars(&outcome.untrusted_text, PROMPT_CONTEXT).to_owned(),
                     }));
                 }
                 outcome
@@ -233,38 +285,30 @@ impl Proxy {
         };
 
         // Tier 2 runs only when Tier 1 has not already blocked the request.
-        let scoring = match classifier {
-            Some(((threshold, action), model))
-                if outcome.action != Some(Action::Block) && !outcome.untrusted_text.is_empty() =>
-            {
-                let text = std::mem::take(&mut outcome.untrusted_text);
-                let started = Instant::now();
-                let task = tokio::task::spawn_blocking(move || {
-                    model.score(&text).map(|score| (score, started.elapsed()))
-                });
-                Some((threshold, action, task))
-            }
-            _ => None,
-        };
-        let Some((threshold, model_action, task)) = scoring else {
+        let task = (!jobs.is_empty()
+            && outcome.action != Some(Action::Block)
+            && !outcome.untrusted_text.is_empty())
+        .then(|| {
+            let text = std::mem::take(&mut outcome.untrusted_text);
+            tokio::task::spawn_blocking(move || jobs.run(&text))
+        });
+        let Some(task) = task else {
             return Ok(self.decide(route, parts, body, outcome).await);
         };
 
         if !route.classifier_parallel {
-            return Ok(match classifier_verdict(route, task, threshold).await {
-                Some(hit) => {
-                    if hit {
-                        add_classifier_finding(&mut outcome, model_action);
-                    }
+            return Ok(match tier2_verdict(route, task).await {
+                Some(found) => {
+                    add_model_findings(&mut outcome, &found);
                     self.decide(route, parts, body, outcome).await
                 }
                 None => self.uninspected(route, parts, body).await,
             });
         }
 
-        // Forward what Tier 1 allows while the classifier runs, and hold the
-        // response until it has decided. Its latency then hides behind the
-        // provider's time to first token instead of adding to it.
+        // Forward what Tier 1 allows while the models run, and hold the
+        // response until they have decided. Their latency then hides behind
+        // the provider's time to first token instead of adding to it.
         let tier1 = if route.shadow { None } else { outcome.action };
         let body_out = match tier1 {
             Some(Action::Redact) => outcome.redacted_body.take().unwrap_or(body),
@@ -273,21 +317,20 @@ impl Proxy {
         let proxy = self.clone();
         let upstream =
             tokio::spawn(async move { proxy.forward(with_body(parts, body_out), tier1).await });
-        let hit = match classifier_verdict(route, task, threshold).await {
-            Some(hit) => hit,
+        let found = match tier2_verdict(route, task).await {
+            Some(found) => found,
             None if route.fail_mode == FailMode::Closed && !route.shadow => {
                 upstream.abort();
                 return Ok(uninspectable());
             }
-            None => false,
+            None => Vec::new(),
         };
-        if hit {
-            add_classifier_finding(&mut outcome, model_action);
-        }
+        add_model_findings(&mut outcome, &found);
         if let Some(action) = outcome.action {
             log_findings(route, action, &outcome);
         }
-        if hit && !route.shadow && model_action == Action::Block {
+        let model_action = found.iter().map(|(_, a)| *a).max();
+        if !route.shadow && model_action == Some(Action::Block) {
             upstream.abort();
             return Ok(policy_violation(&outcome));
         }
@@ -295,11 +338,11 @@ impl Proxy {
             Ok(resp) => resp,
             Err(_) => text(StatusCode::BAD_GATEWAY, "upstream unavailable\n"),
         };
-        if hit && !route.shadow && !resp.headers().contains_key(ACTION_HEADER) {
-            resp.headers_mut().insert(
-                ACTION_HEADER,
-                HeaderValue::from_static(model_action.as_str()),
-            );
+        if let Some(action) = model_action.filter(|_| !route.shadow) {
+            if !resp.headers().contains_key(ACTION_HEADER) {
+                resp.headers_mut()
+                    .insert(ACTION_HEADER, HeaderValue::from_static(action.as_str()));
+            }
         }
         Ok(resp)
     }
@@ -408,33 +451,93 @@ impl Proxy {
 
 /// Waits for the classifier. `None` means it failed and the route's fail mode
 /// decides.
-async fn classifier_verdict(
+/// Finding labels from Tier 2 models, with the action each calls for.
+type ModelFindings = Vec<(String, Action)>;
+
+/// The Tier 2 models a request is checked with, and their rules.
+struct Tier2 {
+    injection: Option<((f32, Action), Arc<Classifier>)>,
+    safety: Option<(policy::SafetyRule, Arc<moderation::Safety>)>,
+    topics: Option<(policy::TopicRule, Arc<moderation::Topics>)>,
+}
+
+impl Tier2 {
+    fn is_empty(&self) -> bool {
+        self.injection.is_none() && self.safety.is_none() && self.topics.is_none()
+    }
+
+    /// Runs the models on the prompt text; returns the findings and their
+    /// actions, and how long it took. Blocking and CPU-bound.
+    fn run(&self, text: &str) -> anyhow::Result<(ModelFindings, Duration)> {
+        let started = Instant::now();
+        let mut found = Vec::new();
+        if let Some(((threshold, action), model)) = &self.injection {
+            if model.score(text)? >= *threshold {
+                found.push((Kind::InjectionClassifier.id(), *action));
+            }
+        }
+        if let Some((rule, model)) = &self.safety {
+            let labels = model.check(text, None, rule)?;
+            found.extend(labels.into_iter().map(|l| (l, rule.action)));
+        }
+        if let Some((rule, model)) = &self.topics {
+            let labels = model.check(text, rule)?;
+            found.extend(labels.into_iter().map(|l| (l, rule.action)));
+        }
+        Ok((found, started.elapsed()))
+    }
+}
+
+/// Tier 2 models loaded at startup. Each is optional; routes that need a
+/// missing one are rejected by [`Proxy::with_models`].
+#[derive(Clone, Default)]
+pub struct Models {
+    /// Prompt-injection classifier.
+    pub injection: Option<Arc<Classifier>>,
+    /// Moderation model for `content_safety`.
+    pub safety: Option<Arc<moderation::Safety>>,
+    /// Zero-shot model for `topics`.
+    pub topics: Option<Arc<moderation::Topics>>,
+}
+
+/// Characters of the prompt kept to judge the answer in context.
+const PROMPT_CONTEXT: usize = 2000;
+
+/// The last `n` bytes of `s` or fewer, cut at a character boundary.
+fn last_chars(s: &str, n: usize) -> &str {
+    let mut start = s.len().saturating_sub(n);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+/// The findings of the Tier 2 models, or `None` if they failed.
+async fn tier2_verdict(
     route: &policy::Route,
-    task: tokio::task::JoinHandle<anyhow::Result<(f32, Duration)>>,
-    threshold: f32,
-) -> Option<bool> {
+    task: tokio::task::JoinHandle<anyhow::Result<(ModelFindings, Duration)>>,
+) -> Option<ModelFindings> {
     match task.await {
-        Ok(Ok((score, elapsed))) => {
-            tracing::debug!(route = %route.name, score, elapsed_us = elapsed.as_micros() as u64, "injection classifier");
-            Some(score >= threshold)
+        Ok(Ok((found, elapsed))) => {
+            tracing::debug!(route = %route.name, ?found, elapsed_us = elapsed.as_micros() as u64, "tier 2 models");
+            Some(found)
         }
         Ok(Err(err)) => {
-            tracing::warn!(route = %route.name, error = %format!("{err:#}"), "injection classifier failed");
+            tracing::warn!(route = %route.name, error = %format!("{err:#}"), "tier 2 model failed");
             None
         }
         Err(err) => {
-            tracing::warn!(route = %route.name, error = %err, "injection classifier panicked");
+            tracing::warn!(route = %route.name, error = %err, "tier 2 model panicked");
             None
         }
     }
 }
 
-fn add_classifier_finding(outcome: &mut inspect::Outcome, action: Action) {
-    *outcome
-        .findings
-        .entry(Kind::InjectionClassifier.id())
-        .or_default() += 1;
-    outcome.action = outcome.action.max(Some(action));
+fn add_model_findings(outcome: &mut inspect::Outcome, found: &[(String, Action)]) {
+    for (label, action) in found {
+        *outcome.findings.entry(label.clone()).or_default() += 1;
+        outcome.action = outcome.action.max(Some(*action));
+    }
 }
 
 fn log_findings(route: &policy::Route, action: Action, outcome: &inspect::Outcome) {

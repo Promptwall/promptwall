@@ -1,0 +1,7 @@
+{
+  "id2label": {
+    "0": "not_entailment",
+    "1": "entailment"
+  },
+  "max_position_embeddings": 16
+}

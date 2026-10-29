@@ -6,6 +6,7 @@ windowing, batching and ONNX Runtime without downloading a real model.
 """
 
 import json
+import shutil
 from pathlib import Path
 
 import onnx
@@ -21,7 +22,9 @@ for i, word in enumerate("hello please summarise this report the a of and to".sp
 tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
 tok.pre_tokenizer = pre_tokenizers.Whitespace()
 tok.post_processor = processors.TemplateProcessing(
-    single="[CLS] $A [SEP]", special_tokens=[("[CLS]", 2), ("[SEP]", 3)]
+    single="[CLS] $A [SEP]",
+    pair="[CLS] $A [SEP] $B:1 [SEP]:1",
+    special_tokens=[("[CLS]", 2), ("[SEP]", 3)],
 )
 tok.save(str(out / "tokenizer.json"))
 
@@ -64,3 +67,22 @@ onnx.save(model, str(out / "model.onnx"))
 (out / "config.json").write_text(
     json.dumps({"id2label": {"0": "SAFE", "1": "INJECTION"}, "max_position_embeddings": 16}, indent=2) + "\n"
 )
+
+# The same model as a moderation model (an "unsafe" gate plus one category
+# that always passes its threshold) and as an NLI model for topics: there,
+# a text "entails" any hypothesis when either of them contains "attack".
+variants = {
+    "tiny-safety": (
+        {"problem_type": "multi_label_classification", "id2label": {"0": "other", "1": "unsafe"}},
+        {"thresholds.json": {"unsafe": 0.5, "categories": {"other": 0.4}}},
+    ),
+    "tiny-nli": ({"id2label": {"0": "not_entailment", "1": "entailment"}}, {}),
+}
+for name, (config, extra) in variants.items():
+    d = out.parent / name
+    d.mkdir(exist_ok=True)
+    for f in ["model.onnx", "tokenizer.json"]:
+        shutil.copy(out / f, d / f)
+    (d / "config.json").write_text(json.dumps({**config, "max_position_embeddings": 16}, indent=2) + "\n")
+    for f, v in extra.items():
+        (d / f).write_text(json.dumps(v, indent=2) + "\n")

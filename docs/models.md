@@ -1,6 +1,14 @@
 # Models (Tier 2)
 
-Tier 2 detectors are small transformer classifiers that run on CPU with ONNX Runtime. Today there is one: the prompt-injection classifier, loaded with `--injection-model <dir>` (or `PROMPTWALL_INJECTION_MODEL`).
+Tier 2 detectors are small transformer classifiers that run on CPU with ONNX Runtime. Each is loaded from a directory at startup:
+
+| Flag (environment variable) | Detector | Recommended model |
+| --- | --- | --- |
+| `--injection-model` (`PROMPTWALL_INJECTION_MODEL`) | `prompt_injection` (entity `classifier`) | [Horizon-Labs/prompt-injection-guard-small](https://huggingface.co/Horizon-Labs/prompt-injection-guard-small) |
+| `--safety-model` (`PROMPTWALL_SAFETY_MODEL`) | `content_safety` | [Horizon-Labs/content-safety-guard-small](https://huggingface.co/Horizon-Labs/content-safety-guard-small) |
+| `--topic-model` (`PROMPTWALL_TOPIC_MODEL`) | `topics` | [Horizon-Labs/multilingual-zeroshot-small](https://huggingface.co/Horizon-Labs/multilingual-zeroshot-small) |
+
+All three are Apache 2.0, multilingual, about 140M parameters, and ship an int8 ONNX file (`onnx/model_quantized.onnx`, about 270 MB). A route that uses a detector whose model is not loaded is an error at startup.
 
 ## Model directory
 
@@ -8,11 +16,29 @@ Tier 2 detectors are small transformer classifiers that run on CPU with ONNX Run
 | --- | --- |
 | `model.onnx` | A sequence-classification model. Inputs `input_ids` and `attention_mask` (and `token_type_ids` if the model has one); first output the logits, shaped `[batch, labels]`. |
 | `tokenizer.json` | The matching Hugging Face tokenizer. |
-| `config.json` | Optional. `id2label` picks the label that means "attack" (one containing `injection`, `jailbreak`, `malicious` or `unsafe`, otherwise label 1); `max_position_embeddings` caps the window length (at most 512 tokens). |
+| `config.json` | Optional for the injection model, required for the others. `id2label` names the labels: for injection, the label that means "attack" (one containing `injection`, `jailbreak`, `malicious` or `unsafe`, otherwise label 1); for safety, the categories; for topics, an `entailment` label. `problem_type: multi_label_classification` gives each label its own probability (sigmoid) instead of a softmax. `max_position_embeddings` caps the window length (at most 512 tokens). |
+| `thresholds.json` | Safety model only, optional: `{"unsafe": 0.5, "categories": {"hate": 0.2, ...}}`. |
+
+To see what a model makes of a text: `cargo run --release -p promptwall-classify --example classify_text -- <dir> "<text>" [--before <prompt> | --after <hypothesis>]`.
 
 Any Hugging Face text classifier exported to ONNX fits, for example with `optimum-cli export onnx --model <id> --task text-classification <dir>`.
 
 Long texts are split into overlapping windows of up to 512 tokens. The score is the highest window score, so an attack inside a long document is not averaged away. At most 8 windows are scored, taken from the end of the text, where the newest user input is.
+
+## Content safety
+
+`content_safety` works with two kinds of moderation model:
+
+- **A guard with an `unsafe` label plus harm categories**, like content-safety-guard. A text is harmful when `unsafe` reaches the threshold: the route's `threshold`, else the one in `thresholds.json`, else 0.5. Findings then name the categories above their own thresholds (`safety.weapons`, `safety.criminal_planning`), or `safety.unsafe` when none stands out. Its categories are `hate`, `harassment`, `violence`, `weapons`, `sexual`, `sexual_minors`, `self_harm`, `criminal_planning`, `drugs`, `privacy`, `profanity`, `fraud_manipulation`, `misinformation`, `unauthorized_advice` and `other`.
+- **A model whose labels are each a harm**, like the Detoxify toxicity models ([Horizon-Labs/multilingual-toxicity-small](https://huggingface.co/Horizon-Labs/multilingual-toxicity-small): `toxicity`, `insult`, `threat`, `obscene`, ...). Every label at or above the threshold is a finding.
+
+On answers, the model judges the answer together with the end of the prompt it answers.
+
+False alarms: on the 179 benign prompts of the evaluation set above, content-safety-guard-small (int8) flags 7 (3.9%) at its default threshold of 0.5. At 0.8 it flags 3 (1.7%), and at 0.9 one. The flagged prompts are mostly villain role-play ("Pretend to be Vicious, threatening a rival"). It also flags some harmless questions in other languages, such as "Wie kann ich meine Kreditkarte sperren lassen?" ("How do I block my credit card?") at 0.58. Start with `shadow: true` or `action: flag`, then block with a threshold around 0.8.
+
+## Topics
+
+`topics` uses a zero-shot classifier: a natural language inference model that judges whether the prompt entails "This text is about {topic}." for each topic in `deny` and `allow`. All topics are scored in one batch. Topic names are best written in English, as plain descriptions ("personal finance", "medical advice"), even when prompts are in other languages. Broader names score more reliably than narrow ones: for "Wie kann ich meine Kreditkarte sperren lassen?" the model gives 0.69 for "banking" and 0.98 for "money and banking".
 
 ## Latency
 
@@ -23,9 +49,13 @@ Transformer classifiers are far slower than the Tier 1 patterns. Measured with `
 | ProtectAI DeBERTa-v3 base, fp32, 4 threads | 30 ms | 97 ms | 430 ms |
 | Horizon-Labs mmBERT-small, int8, 4 threads | 12 ms | 40 ms | 176 ms |
 
-So the classifier does not sit in front of the provider call. By default (`parallel: true`) the request is forwarded as soon as the Tier 1 checks pass, and the classifier runs at the same time. The provider's response is held until the classifier has decided: on a block, the provider call is cancelled and the app gets `403`, so neither the answer nor any tool call in it reaches the app. Because providers take hundreds of milliseconds to the first token, the classifier usually adds no latency.
+The content-safety and zero-shot models are the same size as the mmBERT-small injection model. Through the proxy, a route with `content_safety` and four topics took about 90 ms for a short prompt on this VM.
 
-The prompt itself has reached the provider by then, which is harmless for injection (the damage is done through the answer) but costs the tokens generated before the cancel. PII and secret checks always run before forwarding. Routes that use tools the provider runs itself (hosted web search, code execution, remote MCP servers) should set `parallel: false`, so the classifier finishes before anything is sent.
+So the classifiers do not sit in front of the provider call. By default (`parallel: true`) the request is forwarded as soon as the Tier 1 checks pass, and the classifier runs at the same time. The provider's response is held until the classifier has decided: on a block, the provider call is cancelled and the app gets `403`, so neither the answer nor any tool call in it reaches the app. Because providers take hundreds of milliseconds to the first token, the classifier usually adds no latency.
+
+The prompt itself has reached the provider by then, which is harmless for injection (the damage is done through the answer) but costs the tokens generated before the cancel. PII and secret checks always run before forwarding. Routes that use tools the provider runs itself (hosted web search, code execution, remote MCP servers) should set `parallel: false`, so the classifier finishes before anything is sent. The `parallel` setting of `prompt_injection` applies to all of a route's Tier 2 checks on requests.
+
+Answers are different: they cannot be released before they are checked. With `content_safety` on a route's output, a whole answer waits for the model. A streamed answer is judged each time about 256 more bytes of text have arrived, and at the end. Only judged text is sent on, so streaming arrives in steps, each delayed by one model run.
 
 ## Accuracy
 
