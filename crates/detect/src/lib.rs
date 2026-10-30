@@ -453,7 +453,22 @@ impl Detector {
 
     /// Finds all sensitive values in `text`, sorted by position, without overlaps.
     pub fn scan(&self, text: &str) -> Vec<Finding> {
-        self.find(&self.set, None, text)
+        let found = self.find(&self.set, None, text);
+        let hidden = self.scan_hidden(text);
+        if hidden.is_empty() {
+            return found;
+        }
+        // A hidden value overlapping one found as written is the same value.
+        let mut all: Vec<Finding> = found;
+        all.extend(hidden);
+        all.sort_by_key(|f| (f.start, std::cmp::Reverse(f.end)));
+        let mut out: Vec<Finding> = Vec::with_capacity(all.len());
+        for f in all {
+            if out.last().is_none_or(|last| f.start >= last.end) {
+                out.push(f);
+            }
+        }
+        out
     }
 
     /// Like [`Detector::scan`] with the injection rules only.

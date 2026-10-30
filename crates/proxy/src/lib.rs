@@ -16,6 +16,7 @@ pub use promptwall_engine::{inspect, limits, moderation, ner, policy, text, tool
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use hyper::service::service_fn;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use promptwall_classify::Classifier;
 use promptwall_detect::{Kind, SystemPromptIndex};
@@ -52,6 +53,10 @@ const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const ACTION_HEADER: &str = "x-promptwall-action";
 /// The ID of the request in the decision log.
 const REQUEST_ID_HEADER: &str = "x-promptwall-request-id";
+/// Time a client has to send the headers of a request.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connections served at once unless `--max-connections` says otherwise.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 /// Where the check API is served, when it is on. Under `/promptwall/` so that
 /// it cannot clash with a provider's own paths.
 pub const CHECK_PATH: &str = "/promptwall/v1/check";
@@ -80,6 +85,7 @@ struct Inner {
     client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
     /// The check API, when it is on: `Some(token)` if callers need one.
     check_api: OnceLock<Option<String>>,
+    max_connections: AtomicUsize,
 }
 
 impl Proxy {
@@ -133,6 +139,7 @@ impl Proxy {
                 models,
                 client,
                 check_api: OnceLock::new(),
+                max_connections: AtomicUsize::new(DEFAULT_MAX_CONNECTIONS),
             }),
         })
     }
@@ -692,6 +699,9 @@ impl Proxy {
             Ok(resp) => {
                 let (mut parts, body) = resp.into_parts();
                 strip_hop_by_hop(&mut parts.headers);
+                // Only Promptwall says what Promptwall did.
+                parts.headers.remove(ACTION_HEADER);
+                parts.headers.remove(REQUEST_ID_HEADER);
                 if let Some(action) = action {
                     parts
                         .headers
@@ -830,7 +840,16 @@ impl Proxy {
         shutdown: impl std::future::Future<Output = ()>,
     ) -> anyhow::Result<()> {
         tokio::pin!(shutdown);
+        // Past the limit, new connections wait in the kernel's backlog
+        // instead of using up memory and file handles.
+        let slots = Arc::new(tokio::sync::Semaphore::new(
+            self.inner.max_connections.load(Ordering::Relaxed),
+        ));
         loop {
+            let slot = tokio::select! {
+                slot = slots.clone().acquire_owned() => slot?,
+                _ = &mut shutdown => return Ok(()),
+            };
             let (stream, peer) = tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok(conn) => conn,
@@ -844,11 +863,25 @@ impl Proxy {
             let _ = stream.set_nodelay(true);
             let proxy = self.clone();
             tokio::spawn(async move {
+                let _slot = slot;
                 let service = service_fn(move |req| {
                     let proxy = proxy.clone();
                     async move { proxy.handle(req).await }
                 });
-                if let Err(err) = auto::Builder::new(TokioExecutor::new())
+                let mut builder = auto::Builder::new(TokioExecutor::new());
+                // A client that sends its headers slowly, or never, would
+                // otherwise hold its connection open for good.
+                builder
+                    .http1()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(HEADER_TIMEOUT);
+                builder
+                    .http2()
+                    .timer(TokioTimer::new())
+                    .max_concurrent_streams(256)
+                    .keep_alive_interval(Some(Duration::from_secs(30)))
+                    .keep_alive_timeout(Duration::from_secs(20));
+                if let Err(err) = builder
                     .serve_connection(TokioIo::new(stream), service)
                     .await
                 {
@@ -856,6 +889,14 @@ impl Proxy {
                 }
             });
         }
+    }
+
+    /// Connections served at once; more wait until one closes. Applies to
+    /// the next [`Proxy::serve`].
+    pub fn set_max_connections(&self, n: usize) {
+        self.inner
+            .max_connections
+            .store(n.max(1), Ordering::Relaxed);
     }
 }
 

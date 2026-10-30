@@ -66,3 +66,14 @@ That build has every check except the Tier 2 models (`--injection-model`, `--saf
 ## Models
 
 The optional models are separate downloads (about 270 MB each); [models](models.md) says where to get them and how to lay out their directories.
+
+## Sizing
+
+[`scripts/soak.sh`](../scripts/soak.sh) measures a machine: it keeps many 5-second streams open through Promptwall with every Tier 1 check on, and reports latency, memory and open files. On 4 shared vCPUs (with the load generator and the mock provider on the same machine):
+
+| Streams open at once | Added latency (p95) | Memory |
+| --- | --- | --- |
+| about 1,500 | 5 ms | 210 MiB |
+| about 5,000 | seconds: the CPUs are saturated | 900 MiB |
+
+Checking a streamed answer costs CPU for each event the provider sends, so plan about one vCPU per 400 to 500 streams open at once with output checks on, and scale out behind a load balancer beyond that. Without output checks, streams cost little more than forwarding. Memory grows with the request and answer bodies being checked: `--max-connections` (default 10,000) caps how many are open at once, and each checked request can hold up to 32 MiB.

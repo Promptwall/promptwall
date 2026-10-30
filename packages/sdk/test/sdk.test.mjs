@@ -111,3 +111,11 @@ test("blocked errors carry the verdict", () => {
   const err = new PromptwallBlockedError({ findings: { "secret.aws_access_key": 1 } }, "input");
   assert.match(err.message, /blocked the prompt \(secret.aws_access_key\)/);
 });
+
+test("the WebAssembly build passes the attack corpus like the proxy", async () => {
+  const file = fileURLToPath(new URL("../../../tests/attack-corpus.yaml", import.meta.url));
+  const pw = await Promptwall.load({ policyFile: file });
+  const results = pw.test();
+  assert.ok(results.length >= 70);
+  assert.deepEqual(results.filter((r) => r.failure != null), []);
+});

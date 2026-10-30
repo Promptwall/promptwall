@@ -173,6 +173,83 @@ impl Detector {
     }
 }
 
+impl Detector {
+    /// Data findings (PII, secrets, custom patterns) that [`Detector::scan`]
+    /// misses because the value is hidden: split by invisible characters,
+    /// written in fullwidth letters, or base64- or hex-encoded. Spans are in
+    /// `text`; an encoded value is reported on the whole encoded run.
+    pub(crate) fn scan_hidden(&self, text: &str) -> Vec<Finding> {
+        let data = |f: &Finding| f.kind.category() != Category::Injection;
+        let mut out = Vec::new();
+        if !text.is_ascii() {
+            if let Some((clean, from)) = unhide(text) {
+                for f in self
+                    .find(&self.set, None, &clean)
+                    .iter()
+                    .filter(|f| data(f))
+                {
+                    out.push(Finding {
+                        kind: f.kind,
+                        start: from[f.start].0,
+                        end: from[f.end - 1].1,
+                    });
+                }
+            }
+        }
+        for (start, end) in encoded_runs(text) {
+            let run = &text[start..end];
+            let decoded = if run.len() % 2 == 0 && run.bytes().all(|b| b.is_ascii_hexdigit()) {
+                hex(run)
+            } else {
+                base64(run)
+            };
+            let Some(decoded) = decoded.and_then(readable) else {
+                continue;
+            };
+            if let Some(f) = self.find(&self.set, None, &decoded).into_iter().find(data) {
+                out.push(Finding {
+                    kind: f.kind,
+                    start,
+                    end,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// `text` without invisible characters and with fullwidth ASCII folded to
+/// ASCII, and for each byte of it the span of the character in `text` it
+/// came from; `None` when nothing changes.
+fn unhide(text: &str) -> Option<(String, Vec<(usize, usize)>)> {
+    let mut clean = String::with_capacity(text.len());
+    let mut from = Vec::with_capacity(text.len());
+    let mut changed = false;
+    for (i, c) in text.char_indices() {
+        let span = (i, i + c.len_utf8());
+        let out = match c {
+            c if invisible(c) => None,
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0),
+            '\u{3000}' => Some(' '),
+            c => Some(c),
+        };
+        changed |= out != Some(c);
+        if let Some(o) = out {
+            clean.push(o);
+            from.extend(std::iter::repeat_n(span, o.len_utf8()));
+        }
+    }
+    changed.then_some((clean, from))
+}
+
+/// Characters that take no space: zero-width, soft hyphens, direction marks,
+/// byte-order marks and Unicode tags.
+fn invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
+}
+
 /// A many-shot jailbreak: one message holding a long dialogue between a user
 /// and an assistant, written out to make the model continue the pattern.
 fn many_shot(text: &str) -> Option<Finding> {

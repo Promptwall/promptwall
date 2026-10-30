@@ -86,7 +86,9 @@ pub fn inspect(
     // A redacted body is sent on as valid UTF-8; otherwise the original goes.
     let lossy = String::from_utf8_lossy(body);
     let body = lossy.as_bytes();
-    if let Ok(mut json) = serde_json::from_slice::<Value>(body) {
+    // JSON with a key twice is read as text: parsers disagree on which copy
+    // counts, so the provider might act on the copy the check did not see.
+    if let Ok(Strict(mut json)) = serde_json::from_slice::<Strict>(body) {
         let mut changed = false;
         visit_strings(&mut json, None, false, &mut |s, key, trusted| {
             if key.is_some_and(|k| TEXT_KEYS.contains(&k) || SYSTEM_FIELDS.contains(&k)) {
@@ -120,6 +122,66 @@ pub fn inspect(
         }
     }
     Ok(outcome)
+}
+
+/// A JSON value that has no object with the same key twice.
+struct Strict(Value);
+
+impl<'de> serde::Deserialize<'de> for Strict {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(StrictVisitor).map(Strict)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without duplicate keys")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(v.into())
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(v.into())
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_owned()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut out = Vec::new();
+        while let Some(Strict(v)) = seq.next_element()? {
+            out.push(v);
+        }
+        Ok(Value::Array(out))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let Strict(v) = map.next_value()?;
+            if out.insert(key, v).is_some() {
+                return Err(serde::de::Error::custom("duplicate key"));
+            }
+        }
+        Ok(Value::Object(out))
+    }
 }
 
 /// Scans one string, records findings and redacts in place. Returns whether it
@@ -210,6 +272,38 @@ mod tests {
 
     fn actions(pairs: &[(Kind, Action)]) -> HashMap<Kind, Action> {
         pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_key_twice_cannot_hide_a_value() {
+        let acts = actions(&[
+            (Kind::AwsAccessKey, Action::Block),
+            (Kind::Email, Action::Redact),
+        ]);
+        let check = |body: &str| {
+            inspect(
+                &Detector::new(),
+                &acts,
+                body.as_bytes(),
+                Collect::default(),
+                &Default::default(),
+            )
+            .unwrap()
+        };
+        // A provider that reads the first copy would get the key.
+        let twice = r#"{"messages":[{"role":"user","content":"AKIAIOSFODNN7EXAMPLE"}],"messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(check(twice).action, Some(Action::Block));
+        let nested =
+            r#"{"messages":[{"role":"user","content":"AKIAIOSFODNN7EXAMPLE","content":"hi"}]}"#;
+        assert_eq!(check(nested).action, Some(Action::Block));
+        // Redacted as text, both copies.
+        let mail = r#"{"messages":[{"content":"a@corp.io","content":"b@corp.io"}]}"#;
+        let out = check(mail);
+        let sent = String::from_utf8(out.redacted_body.unwrap().to_vec()).unwrap();
+        assert_eq!(
+            sent,
+            r#"{"messages":[{"content":"[REDACTED:EMAIL]","content":"[REDACTED:EMAIL]"}]}"#
+        );
     }
 
     #[test]
