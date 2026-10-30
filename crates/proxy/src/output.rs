@@ -406,6 +406,8 @@ enum EventBody {
     Delta {
         json: Value,
         fields: Vec<(Vec<PathPart>, usize)>,
+        /// The event as received, sent as is when nothing in it is redacted.
+        raw: Bytes,
     },
     /// A final event that repeats the whole answer, waiting for the PII model.
     Snapshot(Value),
@@ -750,7 +752,7 @@ impl Sse {
         let body = if fields.is_empty() {
             EventBody::Raw(raw)
         } else {
-            EventBody::Delta { json, fields }
+            EventBody::Delta { json, fields, raw }
         };
         self.pending.push_back(Event {
             head,
@@ -830,12 +832,22 @@ impl Sse {
                 out.extend_from_slice(event.head.as_bytes());
                 out.extend_from_slice(format!("data: {json}\n\n").as_bytes());
             }
-            EventBody::Delta { mut json, fields } => {
-                if !self.redactions.is_empty() {
-                    for (path, start) in &fields {
-                        if let Some(Value::String(s)) = pointer_mut(&mut json, path) {
-                            *s = rewrite(s, *start, &self.redactions);
-                        }
+            EventBody::Delta {
+                mut json,
+                fields,
+                raw,
+            } => {
+                let start = fields.iter().map(|f| f.1).min().unwrap_or(event.text_end);
+                let touched = self
+                    .redactions
+                    .iter()
+                    .any(|r| r.0 < event.text_end && r.1 > start);
+                if !touched {
+                    return out.extend_from_slice(&raw);
+                }
+                for (path, start) in &fields {
+                    if let Some(Value::String(s)) = pointer_mut(&mut json, path) {
+                        *s = rewrite(s, *start, &self.redactions);
                     }
                 }
                 out.extend_from_slice(event.head.as_bytes());

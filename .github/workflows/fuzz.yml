@@ -1,0 +1,40 @@
+name: Fuzz
+
+# Weekly, and by hand (Actions, Fuzz, Run workflow): each libFuzzer target in
+# fuzz/ runs for a few minutes. A crash fails the job and uploads the input
+# that caused it; reproduce with `cargo +nightly fuzz run <target> <file>`.
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [scan, inspect, policy, wasm_call]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz
+        working-directory: fuzz
+        run: cargo fuzz run -O ${{ matrix.target }} -- -max_total_time=${{ inputs.seconds || '300' }} -max_len=8192
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/

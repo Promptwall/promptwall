@@ -91,6 +91,18 @@ async fn handle(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split_once(' '))
         .map(|(name, args)| (name.to_owned(), args.to_owned()));
+    // Or exact bytes (hex), for fuzzing the proxy's stream parser: sent as
+    // they are, in pieces of `x-reply-chunk` bytes, as `x-raw-type`.
+    let raw = req
+        .headers()
+        .get("x-raw-hex")
+        .and_then(|v| v.to_str().ok())
+        .and_then(unhex);
+    let raw_type = req
+        .headers()
+        .get("x-raw-type")
+        .cloned()
+        .unwrap_or(HeaderValue::from_static("text/event-stream"));
     let reply_chunk = req
         .headers()
         .get("x-reply-chunk")
@@ -105,7 +117,16 @@ async fn handle(
 
     tokio::time::sleep(config.delay).await;
 
-    let mut resp = if echo_body {
+    let mut resp = if let Some(raw) = raw {
+        let frames: Vec<Result<Frame<Bytes>, Infallible>> = raw
+            .chunks(reply_chunk)
+            .map(|c| Ok(Frame::data(Bytes::copy_from_slice(c))))
+            .collect();
+        let body = StreamBody::new(tokio_stream::iter(frames));
+        let mut resp = Response::new(BodyExt::boxed(body));
+        resp.headers_mut().insert(header::CONTENT_TYPE, raw_type);
+        resp
+    } else if echo_body {
         Response::new(Full::new(body.clone()).boxed())
     } else if reply.is_some() || tool_call.is_some() {
         reply_response(&reply.unwrap_or_default(), tool_call, stream, reply_chunk)
@@ -154,6 +175,14 @@ async fn handle(
     resp.headers_mut()
         .insert("x-request-bytes", HeaderValue::from(body.len()));
     Ok(resp)
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    (s.len() % 2 == 0).then_some(())?;
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// An OpenAI-style answer with the given text, whole or as a stream of deltas.

@@ -83,7 +83,9 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | `packages/sdk` | `@promptwall/sdk`: the same policy in Node, edge runtimes and browsers, with OpenAI and Vercel AI SDK wrappers |
 | `crates/classify` | Tier 2 classifiers on CPU with ONNX Runtime (prompt injection) |
 | `crates/mock-upstream` | Mock OpenAI-compatible upstream used by tests and benchmarks |
-| `crates/bench` | `pw-bench`, the latency benchmark |
+| `crates/bench` | `pw-bench`, the latency benchmark (`scripts/bench.sh`; load test: `scripts/soak.sh`) |
+| `tests/attack-corpus.yaml` | Attacks and evasions the checks must keep catching, run in CI |
+| `fuzz` | libFuzzer targets (nightly Rust and `cargo fuzz`), run weekly in CI |
 
 ## Documentation
 

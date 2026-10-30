@@ -96,6 +96,11 @@ struct Args {
     #[arg(long, env = "PROMPTWALL_CHECK_TOKEN", hide_env_values = true)]
     check_token: Option<String>,
 
+    /// Connections served at once; more wait until one closes. Each open
+    /// connection uses a file handle and some memory.
+    #[arg(long, env = "PROMPTWALL_MAX_CONNECTIONS", default_value_t = promptwall::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
+
     /// Threads each classifier session may use for one inference (default 1).
     /// More threads make each check faster; more sessions let more checks run
     /// at the same time.
@@ -294,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(%addr, "metrics on /metrics");
         tokio::spawn(promptwall::metrics::serve(listener));
     }
+    proxy.set_max_connections(args.max_connections);
     if args.check_api {
         if args.check_token.is_none() {
             tracing::warn!("check API on without a token: keep the port off the public network");
