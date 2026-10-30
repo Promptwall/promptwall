@@ -82,7 +82,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The release build links the ONNX Runtime that ort downloads into
+      # ~/.cache/ort.pyke.io. Cache it with target/: a restored ort-sys build
+      # that points at a download missing on the new runner fails to link.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ort
+          cache-directories: ~/.cache/ort.pyke.io
       # Shared CI runners are noisy, so the gate here is looser than the
       # 2 ms pass-through target in docs/specs/benchmark.md.
       - name: Pass-through

@@ -5,7 +5,7 @@
 #   BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh
 set -euo pipefail
 
-cargo build --release --quiet
+cargo build --release --quiet -p promptwall -p pw-mock-upstream -p pw-bench
 bin=target/release
 
 "$bin/pw-mock-upstream" --listen 127.0.0.1:9000 --delay-ms 50 2>/dev/null &
