@@ -84,6 +84,18 @@ struct Args {
     #[arg(long, env = "PROMPTWALL_RELOAD_INTERVAL", default_value_t = 2)]
     reload_interval: u64,
 
+    /// Serve the check API on POST /promptwall/v1/check, which returns a
+    /// route's verdict on one prompt or answer, Tier 2 models included. The
+    /// npm package (@promptwall/sdk) uses it for the model checks it cannot
+    /// run itself.
+    #[arg(long, env = "PROMPTWALL_CHECK_API")]
+    check_api: bool,
+
+    /// Bearer token that callers of the check API must send. Set it through
+    /// the environment so it stays out of the process list.
+    #[arg(long, env = "PROMPTWALL_CHECK_TOKEN", hide_env_values = true)]
+    check_token: Option<String>,
+
     /// Threads each classifier session may use for one inference (default 1).
     /// More threads make each check faster; more sessions let more checks run
     /// at the same time.
@@ -166,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
     let policy = match &args.policy {
-        Some(path) => promptwall::Policy::load_signed(path, public_key.as_ref())?,
+        Some(path) => promptwall::signing::load_policy(path, public_key.as_ref())?,
         None => promptwall::Policy::passthrough(&args.upstream)?,
     };
     let routes: Vec<String> = policy.routes.iter().map(|r| r.name.clone()).collect();
@@ -281,6 +293,13 @@ async fn main() -> anyhow::Result<()> {
         let (listener, addr) = promptwall::bind(addr).await?;
         tracing::info!(%addr, "metrics on /metrics");
         tokio::spawn(promptwall::metrics::serve(listener));
+    }
+    if args.check_api {
+        if args.check_token.is_none() {
+            tracing::warn!("check API on without a token: keep the port off the public network");
+        }
+        proxy.enable_check_api(args.check_token);
+        tracing::info!(path = promptwall::CHECK_PATH, "check API on");
     }
     if let Some(path) = args.policy.filter(|_| args.reload_interval > 0) {
         tokio::spawn(promptwall::reload::watch(

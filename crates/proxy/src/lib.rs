@@ -7,20 +7,16 @@
 
 pub mod decision;
 pub mod init;
-pub mod inspect;
-pub mod limits;
 pub mod metrics;
-pub mod moderation;
-pub mod ner;
 pub mod output;
-pub mod policy;
 pub mod reload;
 pub mod signing;
-pub mod tools;
+
+pub use promptwall_engine::{inspect, limits, moderation, ner, policy, text, tools};
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -56,6 +52,9 @@ const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const ACTION_HEADER: &str = "x-promptwall-action";
 /// The ID of the request in the decision log.
 const REQUEST_ID_HEADER: &str = "x-promptwall-request-id";
+/// Where the check API is served, when it is on. Under `/promptwall/` so that
+/// it cannot clash with a provider's own paths.
+pub const CHECK_PATH: &str = "/promptwall/v1/check";
 
 /// Headers that apply to a single connection and must not be forwarded
 /// (RFC 9110, section 7.6.1).
@@ -79,6 +78,8 @@ struct Inner {
     policy: RwLock<Arc<Policy>>,
     models: Models,
     client: Client<HttpsConnector<HttpConnector>, ProxyBody>,
+    /// The check API, when it is on: `Some(token)` if callers need one.
+    check_api: OnceLock<Option<String>>,
 }
 
 impl Proxy {
@@ -131,8 +132,149 @@ impl Proxy {
                 policy: RwLock::new(Arc::new(policy)),
                 models,
                 client,
+                check_api: OnceLock::new(),
             }),
         })
+    }
+
+    /// Serves the check API on `/promptwall/v1/check`: apps (and the npm
+    /// package) send it one prompt or answer and get the route's verdict,
+    /// models included. With a token, callers must send it as a bearer token.
+    /// Takes effect once; later calls do nothing.
+    pub fn enable_check_api(&self, token: Option<String>) {
+        let _ = self.inner.check_api.set(token.filter(|t| !t.is_empty()));
+    }
+
+    /// Answers one call of the check API.
+    async fn check_api(&self, req: Request<Incoming>, token: Option<&str>) -> Response<ProxyBody> {
+        if req.method() != http::Method::POST {
+            return json_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "promptwall_method_not_allowed",
+                "Use POST",
+                &[],
+            );
+        }
+        if let Some(token) = token {
+            let sent = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .unwrap_or_default();
+            if !same(sent.as_bytes(), token.as_bytes()) {
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "promptwall_unauthorized",
+                    "Missing or wrong bearer token for the check API",
+                    &[],
+                );
+            }
+        }
+        let body = match Limited::new(req.into_body(), MAX_SCAN_BYTES)
+            .collect()
+            .await
+        {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => {
+                return json_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "promptwall_body_too_large",
+                    "Request body is too large or could not be read",
+                    &[],
+                )
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct CheckRequest {
+            route: Option<String>,
+            #[serde(default)]
+            direction: Direction,
+            text: String,
+        }
+        #[derive(Default, serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Direction {
+            #[default]
+            Input,
+            Output,
+        }
+        let call: CheckRequest = match serde_json::from_slice(&body) {
+            Ok(call) => call,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "promptwall_invalid_check",
+                    &format!("Invalid check request: {err}"),
+                    &[],
+                )
+            }
+        };
+        let route = match call.route {
+            Some(route) => route,
+            None => {
+                let policy = self.policy();
+                match policy
+                    .routes
+                    .iter()
+                    .find(|r| r.name == "default")
+                    .or(policy.routes.first())
+                {
+                    Some(route) => route.name.clone(),
+                    None => String::new(),
+                }
+            }
+        };
+        let proxy = self.clone();
+        let started = Instant::now();
+        let checked = {
+            let route = route.clone();
+            tokio::task::spawn_blocking(move || {
+                let sample = match call.direction {
+                    Direction::Input => Sample::Input(&call.text),
+                    Direction::Output => Sample::Output(&call.text),
+                };
+                proxy.check(&route, sample)
+            })
+            .await
+        };
+        let verdict = match checked {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(err)) => {
+                let unknown = !self.policy().routes.iter().any(|r| r.name == route);
+                let (status, code) = if unknown {
+                    (StatusCode::NOT_FOUND, "promptwall_no_route")
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "promptwall_check_failed")
+                };
+                return json_error(status, code, &format!("{err:#}"), &[]);
+            }
+            Err(_) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "promptwall_check_failed",
+                    "The check failed",
+                    &[],
+                )
+            }
+        };
+        let action = verdict.action.map_or("allow", Action::as_str);
+        metrics::count(
+            "promptwall_checks_total",
+            &[("route", &route), ("action", action)],
+            1,
+        );
+        metrics::observe(
+            "promptwall_check_duration_seconds",
+            &[("route", &route), ("stage", "check_api")],
+            started.elapsed(),
+        );
+        let mut body = serde_json::to_value(&verdict).unwrap_or_default();
+        body["route"] = route.into();
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(full(Bytes::from(body.to_string())))
+            .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "error\n"))
     }
 
     /// The policy in force.
@@ -170,6 +312,11 @@ impl Proxy {
     pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<ProxyBody>, Infallible> {
         if req.uri().path() == "/healthz" {
             return Ok(text(StatusCode::OK, "ok\n"));
+        }
+        if req.uri().path() == CHECK_PATH {
+            if let Some(token) = self.inner.check_api.get() {
+                return Ok(self.check_api(req, token.as_deref()).await);
+            }
         }
         let started = Instant::now();
         let policy = self.policy();
@@ -598,15 +745,7 @@ impl Proxy {
                 return output::check_text(&check, text);
             }
         };
-        let body = serde_json::json!({"messages": [{"role": "user", "content": text}]});
-        let body = Bytes::from(body.to_string());
-        let collect = inspect::Collect {
-            untrusted: true,
-            trusted: false,
-        };
-        let mut outcome =
-            inspect::inspect(&route.detector, &route.input, &body, collect, &route.except)
-                .map_err(|_| anyhow::anyhow!("the text could not be inspected"))?;
+        let (mut outcome, body) = text::inspect_input(route, text, true)?;
         if outcome.action != Some(Action::Block) {
             if let Some((rule, model)) = route.pii.as_ref().zip(models.pii.as_ref()) {
                 let current = outcome
@@ -626,20 +765,7 @@ impl Proxy {
             let (found, _) = jobs.run(&outcome.untrusted_text)?;
             add_model_findings(&mut outcome, &found);
         }
-        let text = match (&outcome.redacted_body, outcome.action) {
-            (Some(body), Some(Action::Redact)) => {
-                serde_json::from_slice::<serde_json::Value>(body)?["messages"][0]["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
-            }
-            _ => text.to_owned(),
-        };
-        Ok(Verdict {
-            action: outcome.action,
-            findings: outcome.findings,
-            text,
-        })
+        text::input_verdict(outcome, text)
     }
 
     /// Runs the test cases of the policy (its `tests` section). Blocking,
@@ -795,22 +921,11 @@ pub struct TestResult {
     pub failure: Option<String>,
 }
 
-/// A prompt or an answer to check with [`Proxy::check`].
-#[derive(Clone, Copy, Debug)]
-pub enum Sample<'a> {
-    Input(&'a str),
-    Output(&'a str),
-}
+pub use promptwall_engine::{Sample, Verdict};
 
-/// What a route does with one prompt or answer.
-#[derive(Debug, Default)]
-pub struct Verdict {
-    /// The most severe action, if anything was found.
-    pub action: Option<Action>,
-    /// Finding labels and how often each was found.
-    pub findings: std::collections::BTreeMap<String, usize>,
-    /// The text as it would be sent on, with redactions.
-    pub text: String,
+/// Compares two secrets in time that does not depend on where they differ.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Adds what the PII model found to the outcome of Tier 1.

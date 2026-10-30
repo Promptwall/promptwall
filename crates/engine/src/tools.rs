@@ -100,7 +100,7 @@ impl ArgumentRule {
 }
 
 /// Case-insensitive match where `*` stands for any run of characters.
-pub(crate) fn glob(pattern: &str, text: &str) -> bool {
+pub fn glob(pattern: &str, text: &str) -> bool {
     let (p, t) = (pattern.to_lowercase(), text.to_lowercase());
     let mut parts = p.split('*');
     let first = parts.next().unwrap_or_default();

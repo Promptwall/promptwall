@@ -17,6 +17,7 @@ use http::{Response, StatusCode};
 use http_body_util::{BodyExt, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use promptwall_detect::{Category, Finding, Kind, SystemPromptIndex};
+use promptwall_engine::text::{self, rewrite};
 use serde_json::Value;
 
 use crate::moderation::Safety;
@@ -50,38 +51,7 @@ pub struct OutputCheck {
 impl OutputCheck {
     /// Findings in `text` that the route acts on, sorted and without overlaps.
     fn scan(&self, text: &str) -> Vec<(Finding, Action)> {
-        let rules = &self.rules;
-        if rules.actions.is_empty() {
-            return Vec::new(); // only tool calls are checked
-        }
-        let mut found: Vec<Finding> = rules
-            .detector
-            .scan(text)
-            .into_iter()
-            .filter(|f| rules.actions.contains_key(&f.kind))
-            .filter(|f| {
-                f.kind.category() != Category::Exfiltration
-                    || !allowed(&text[f.start..f.end], &rules.allow_domains)
-            })
-            .filter(|f| !crate::inspect::excepted(&rules.except, f.kind, &text[f.start..f.end]))
-            .collect();
-        if let Some(index) = &self.system {
-            if rules.actions.contains_key(&Kind::SystemPromptLeak) {
-                found.extend(index.find(text));
-                found.sort_by_key(|f| (f.start, std::cmp::Reverse(f.end)));
-                let mut merged: Vec<Finding> = Vec::with_capacity(found.len());
-                for f in found {
-                    if merged.last().is_none_or(|last| f.start >= last.end) {
-                        merged.push(f);
-                    }
-                }
-                found = merged;
-            }
-        }
-        found
-            .into_iter()
-            .map(|f| (f, rules.actions[&f.kind]))
-            .collect()
+        text::scan_output(&self.rules, self.system.as_ref(), text)
     }
 
     /// Records the tool calls that break the route's tool rules; returns the
@@ -108,15 +78,7 @@ impl OutputCheck {
     }
 
     fn marker(&self, kind: Kind) -> String {
-        match kind {
-            Kind::Custom(_) => format!(
-                "[REDACTED:{}]",
-                self.label(kind)
-                    .trim_start_matches("custom.")
-                    .to_ascii_uppercase()
-            ),
-            kind => format!("[REDACTED:{}]", kind.entity().to_ascii_uppercase()),
-        }
+        text::marker(&self.rules, kind)
     }
 
     /// Whether a Tier 2 model must see answer text before it is sent.
@@ -143,22 +105,7 @@ impl OutputCheck {
 /// Checks one answer text the way [`whole`] checks an answer, for
 /// [`crate::Proxy::check`]. Blocking: the models run inline.
 pub(crate) fn check_text(check: &OutputCheck, text: &str) -> anyhow::Result<crate::Verdict> {
-    let mut verdict = crate::Verdict {
-        text: text.to_owned(),
-        ..Default::default()
-    };
-    let found = check.scan(text);
-    let mut spans = Vec::new();
-    for (f, action) in &found {
-        *verdict.findings.entry(check.label(f.kind)).or_insert(0) += 1;
-        verdict.action = verdict.action.max(Some(*action));
-        if *action == Action::Redact {
-            spans.push((f.start, f.end, check.marker(f.kind)));
-        }
-    }
-    if !spans.is_empty() {
-        verdict.text = rewrite(text, 0, &spans);
-    }
+    let mut verdict = text::check_output(&check.rules, text);
     if let Some((rule, model)) = &check.safety {
         let labels = model.check(text, None, rule)?;
         if !labels.is_empty() {
@@ -179,23 +126,6 @@ pub(crate) fn check_text(check: &OutputCheck, text: &str) -> anyhow::Result<crat
         verdict.text = text.to_owned();
     }
     Ok(verdict)
-}
-
-/// Whether the host of `url` is one of `domains` or a subdomain of one.
-fn allowed(url: &str, domains: &[String]) -> bool {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority
-        .rsplit('@')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    domains
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 /// Applies the route's output detectors to a response from the provider.
@@ -454,28 +384,6 @@ fn blocked_response(findings: &BTreeMap<String, usize>) -> Response<ProxyBody> {
         ),
         &kinds,
     )
-}
-
-/// Rewrites `text`, which starts at offset `base` of the whole answer, with
-/// the redactions `spans` (in whole-answer offsets). A span's marker goes where
-/// the span starts; the rest of the span is dropped, including the parts that
-/// fall into other chunks.
-fn rewrite(text: &str, base: usize, spans: &[(usize, usize, String)]) -> String {
-    let end = base + text.len();
-    let mut out = String::with_capacity(text.len());
-    let mut pos = base;
-    for (s, e, marker) in spans {
-        if *e <= pos || *s >= end {
-            continue;
-        }
-        if *s >= pos {
-            out.push_str(&text[pos - base..*s - base]);
-            out.push_str(marker);
-        }
-        pos = (*e).min(end);
-    }
-    out.push_str(&text[pos - base..]);
-    out
 }
 
 /// One server-sent event, held until its text may be released.
@@ -995,27 +903,4 @@ fn floor_char(s: &str, mut i: usize) -> usize {
         i -= 1;
     }
     i
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rewrite_spans_across_chunks() {
-        let spans = vec![(4, 13, "[X]".to_string())];
-        // Whole answer: "abc jane@x.io def", split into three chunks.
-        assert_eq!(rewrite("abc ja", 0, &spans), "abc [X]");
-        assert_eq!(rewrite("ne@x.", 6, &spans), "");
-        assert_eq!(rewrite("io def", 11, &spans), " def");
-    }
-
-    #[test]
-    fn allowed_domains() {
-        let domains = vec!["example.com".to_string()];
-        assert!(allowed("https://cdn.example.com/a.png", &domains));
-        assert!(allowed("https://example.com:8443/a.png?x=1", &domains));
-        assert!(!allowed("https://example.com.evil.io/a.png", &domains));
-        assert!(!allowed("https://evil.io/?u=example.com", &domains));
-    }
 }

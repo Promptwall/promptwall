@@ -53,7 +53,7 @@ const SYSTEM_FIELDS: [&str; 4] = [
 ];
 
 /// Keys of all prompt text, written by the user, tools or the app.
-pub(crate) const PROMPT_KEYS: [&str; 8] = [
+pub const PROMPT_KEYS: [&str; 8] = [
     TEXT_KEYS[0],
     TEXT_KEYS[1],
     TEXT_KEYS[2],
@@ -170,7 +170,7 @@ fn scan_string(
 }
 
 /// Whether `value`, found as `kind`, matches one of the route's exceptions.
-pub(crate) fn excepted(except: &Except, kind: Kind, value: &str) -> bool {
+pub fn excepted(except: &Except, kind: Kind, value: &str) -> bool {
     except
         .get(&kind)
         .is_some_and(|patterns| patterns.iter().any(|p| crate::tools::glob(p, value.trim())))
@@ -178,7 +178,7 @@ pub(crate) fn excepted(except: &Except, kind: Kind, value: &str) -> bool {
 
 /// Calls `f` on every string value with the object key it sits under (arrays
 /// keep their parent's key) and whether it is app-written (trusted).
-pub(crate) fn visit_strings(
+pub fn visit_strings(
     value: &mut Value,
     key: Option<&str>,
     trusted: bool,

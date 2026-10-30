@@ -1134,6 +1134,7 @@ dependencies = [
  "hyper-util",
  "promptwall-classify",
  "promptwall-detect",
+ "promptwall-engine",
  "pw-mock-upstream",
  "ring",
  "rustls",
@@ -1163,6 +1164,33 @@ name = "promptwall-detect"
 version = "0.0.1"
 dependencies = [
  "regex",
+]
+
+[[package]]
+name = "promptwall-engine"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "http",
+ "http-body-util",
+ "promptwall-classify",
+ "promptwall-detect",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
+name = "promptwall-wasm"
+version = "0.0.1"
+dependencies = [
+ "promptwall-engine",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

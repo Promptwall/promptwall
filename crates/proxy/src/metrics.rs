@@ -40,10 +40,14 @@ struct Histogram {
 }
 
 /// Help text of each metric.
-const HELP: [(&str, &str); 7] = [
+const HELP: [(&str, &str); 8] = [
     (
         "promptwall_requests_total",
         "Requests by route and what Promptwall did: allow, flag, redact, block, rate_limited or no_route.",
+    ),
+    (
+        "promptwall_checks_total",
+        "Calls of the check API by route and verdict: allow, flag, redact or block.",
     ),
     (
         "promptwall_findings_total",

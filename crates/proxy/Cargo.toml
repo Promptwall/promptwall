@@ -21,6 +21,7 @@ schemars.workspace = true
 hyper-util.workspace = true
 promptwall-classify = { path = "../classify", default-features = false }
 promptwall-detect = { path = "../detect" }
+promptwall-engine = { path = "../engine" }
 ring.workspace = true
 rustls.workspace = true
 serde.workspace = true

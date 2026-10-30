@@ -1,0 +1,24 @@
+[package]
+name = "promptwall-engine"
+description = "Promptwall policy engine: the policy format and the checks it configures, without the proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# No async runtime or network I/O here: this crate also compiles to
+# WebAssembly for the npm package (crates/wasm).
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+promptwall-classify = { path = "../classify", default-features = false }
+promptwall-detect = { path = "../detect" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2 = "0.10"
+tracing.workspace = true
