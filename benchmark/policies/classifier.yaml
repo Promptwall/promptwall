@@ -1,0 +1,12 @@
+# Benchmark policy, patterns plus the prompt-injection classifier (Tier 2).
+# Needs --injection-model.
+version: 1
+upstreams:
+  none: { url: "http://127.0.0.1:9" }
+routes:
+  - name: injection
+    upstream: none
+    input:
+      - detector: prompt_injection
+        action: block
+        threshold: 0.5

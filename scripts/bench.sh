@@ -3,12 +3,13 @@
 # Extra arguments go to pw-bench, e.g. scripts/bench.sh --stream --max-p95-added-ms 2
 # Set BENCH_POLICY to a policy file to benchmark with detectors on, e.g.
 #   BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh
+# MOCK_ARGS go to the mock upstream, e.g. MOCK_ARGS="--chunks 100 --chunk-ms 12".
 set -euo pipefail
 
 cargo build --release --quiet -p promptwall -p pw-mock-upstream -p pw-bench
 bin=target/release
 
-"$bin/pw-mock-upstream" --listen 127.0.0.1:9000 --delay-ms 50 2>/dev/null &
+"$bin/pw-mock-upstream" --listen 127.0.0.1:9000 --delay-ms 50 ${MOCK_ARGS:-} 2>/dev/null &
 mock=$!
 if [[ -n "${BENCH_POLICY:-}" ]]; then
   target=(--policy "$BENCH_POLICY")
