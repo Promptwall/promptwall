@@ -1,0 +1,17 @@
+[package]
+name = "promptwall-wasm"
+description = "The Promptwall policy engine as a WebAssembly module, for the npm package"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+promptwall-engine = { path = "../engine" }
+serde.workspace = true
+serde_json.workspace = true

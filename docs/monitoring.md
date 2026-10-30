@@ -13,7 +13,8 @@ Labels are route names, actions and finding labels such as `pii.email`. Prompt a
 | --- | --- | --- | --- |
 | `promptwall_requests_total` | counter | `route`, `action` | Requests and what Promptwall did: `allow`, `flag`, `redact`, `block`, `rate_limited`, `no_route`, `error` (provider unreachable) |
 | `promptwall_findings_total` | counter | `route`, `finding`, `direction` | Findings in requests and responses |
-| `promptwall_check_duration_seconds` | histogram | `route`, `stage` | Time spent checking a request: `rules` (Tier 1) or `models` (Tier 2) |
+| `promptwall_check_duration_seconds` | histogram | `route`, `stage` | Time spent checking a request: `rules` (Tier 1) or `models` (Tier 2); `check_api` for a whole call of the [check API](../packages/sdk/README.md#check-api) |
+| `promptwall_checks_total` | counter | `route`, `action` | Calls of the check API and their verdict: `allow`, `flag`, `redact`, `block` |
 | `promptwall_request_duration_seconds` | histogram | `route` | Time until the response headers were sent, including the provider |
 | `promptwall_uninspected_total` | counter | `route`, `direction` | Requests or responses that could not be inspected (compressed, too large, model failure) |
 | `promptwall_upstream_errors_total` | counter | | Requests whose provider could not be reached |

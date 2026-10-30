@@ -36,6 +36,32 @@ jobs:
       - run: cargo clippy -p promptwall -p promptwall-classify --no-default-features --all-targets -- -D warnings
       - run: cargo test -p promptwall -p promptwall-classify --no-default-features
 
+  npm:
+    name: npm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the WebAssembly module
+        working-directory: packages/sdk
+        run: npm run build
+      - name: Build the server for the check API test
+        run: cargo build -p promptwall --no-default-features
+      - name: Test
+        working-directory: packages/sdk
+        run: npm test
+        env:
+          PROMPTWALL_BIN: ${{ github.workspace }}/target/debug/promptwall
+      - name: Package contents
+        working-directory: packages/sdk
+        run: npm pack --dry-run --ignore-scripts
+
   helm:
     name: Helm chart
     runs-on: ubuntu-latest

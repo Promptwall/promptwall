@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/detect", "crates/classify", "crates/proxy", "crates/mock-upstream", "crates/bench"]
+members = ["crates/detect", "crates/classify", "crates/engine", "crates/wasm", "crates/proxy", "crates/mock-upstream", "crates/bench"]
 
 [workspace.package]
 version = "0.0.1"
@@ -32,3 +32,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The WebAssembly module of the npm package: small over fast to build.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

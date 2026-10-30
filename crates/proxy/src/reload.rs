@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::signing::{self, PublicKey};
-use crate::{metrics, Policy, Proxy};
+use crate::{metrics, Proxy};
 
 /// What a check of the policy file did.
 #[derive(Debug, PartialEq)]
@@ -67,7 +67,7 @@ impl Watcher {
             return Reload::Unchanged;
         }
         self.seen = Some(state);
-        let loaded = Policy::load_signed(&self.path, self.key.as_ref())
+        let loaded = crate::signing::load_policy(&self.path, self.key.as_ref())
             .and_then(|policy| proxy.reload(policy));
         let result = if loaded.is_ok() { "ok" } else { "error" };
         metrics::count("promptwall_policy_reloads_total", &[("result", result)], 1);

@@ -11,10 +11,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, AUTHORIZATION};
+use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
-
-use crate::ProxyBody;
 
 /// Keys tracked before old ones are dropped.
 const MAX_KEYS: usize = 100_000;
@@ -206,7 +206,7 @@ pub fn now() -> u64 {
 
 /// Passes `body` through and, once it is done or dropped, adds the tokens it
 /// used to the ticket's counters.
-pub fn meter(body: ProxyBody, ticket: Arc<Ticket>) -> ProxyBody {
+pub fn meter<E: 'static>(body: BoxBody<Bytes, E>, ticket: Arc<Ticket>) -> BoxBody<Bytes, E> {
     let mut meter = Meter {
         ticket,
         usage: Usage::default(),

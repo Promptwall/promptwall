@@ -54,6 +54,16 @@ cd deploy/compose && docker compose --profile demo up --build    # then open htt
 
 See [monitoring](docs/monitoring.md) for the metrics.
 
+Without a proxy, in a JavaScript app (Node, Vercel, Supabase or Cloudflare functions, the browser), the [npm package](packages/sdk/README.md) runs the same policy in-process as WebAssembly:
+
+```js
+import { Promptwall } from "@promptwall/sdk";
+import { wrapOpenAI } from "@promptwall/sdk/openai";
+
+const pw = await Promptwall.load({ policyFile: "promptwall.yaml" });
+const openai = wrapOpenAI(new OpenAI(), pw);   // prompts and answers are now checked
+```
+
 To measure the latency the proxy adds:
 
 ```sh
@@ -66,8 +76,11 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 
 | Path | What it is |
 | --- | --- |
-| `crates/proxy` | The `promptwall` data plane (library and binary): routing, policy, inspection |
+| `crates/proxy` | The `promptwall` data plane (library and binary): HTTP, routing, streaming, models, metrics |
+| `crates/engine` | The policy format and the checks it configures, with no async runtime, so the proxy and the npm package share it |
 | `crates/detect` | Tier 1 detectors for PII, secrets and prompt injection; no I/O, so it can also build for WebAssembly |
+| `crates/wasm` | The engine as a WebAssembly module, for the npm package |
+| `packages/sdk` | `@promptwall/sdk`: the same policy in Node, edge runtimes and browsers, with OpenAI and Vercel AI SDK wrappers |
 | `crates/classify` | Tier 2 classifiers on CPU with ONNX Runtime (prompt injection) |
 | `crates/mock-upstream` | Mock OpenAI-compatible upstream used by tests and benchmarks |
 | `crates/bench` | `pw-bench`, the latency benchmark |
@@ -77,6 +90,7 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | Document | What it covers |
 | --- | --- |
 | [Install](docs/install.md) | Downloads, Docker, Helm, building from source (with or without models) |
+| [npm package](packages/sdk/README.md) | `@promptwall/sdk`: checks in your app, without a proxy; the check API for model checks |
 | [Architecture](docs/architecture.md) | Components, request path, latency budget, deployment modes |
 | [Threat model](docs/specs/threat-model.md) | What the MVP protects against and what it does not |
 | [Policy format](docs/specs/policy-format.md) | The YAML policy language (version 1, stable) and its [JSON Schema](docs/specs/policy-v1.schema.json) |

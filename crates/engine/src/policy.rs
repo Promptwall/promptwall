@@ -14,13 +14,16 @@ use http::uri::{Authority, Scheme};
 use http::Uri;
 use promptwall_detect::{Category, Detector, Kind};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::limits::{LimitKey, Limiter, Limits};
 use crate::tools::{ArgumentRule, ToolRules};
 
 /// What happens when a detector finds something. Ordered by severity.
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Forward unchanged, but log the finding.
@@ -303,15 +306,8 @@ impl Policy {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        Self::load_signed(path, None)
-    }
-
-    /// Loads a policy file; with a key, only if its signature is valid.
-    pub fn load_signed(
-        path: &Path,
-        key: Option<&crate::signing::PublicKey>,
-    ) -> anyhow::Result<Self> {
-        let text = crate::signing::read_policy(path, key)?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read policy file {}", path.display()))?;
         Self::from_yaml(&text).with_context(|| format!("invalid policy file {}", path.display()))
     }
 
@@ -1044,8 +1040,8 @@ pub fn json_schema() -> String {
 
 /// `sha256:` and the hex SHA-256 of `bytes`.
 pub fn digest(bytes: &[u8]) -> String {
-    let hash = ring::digest::digest(&ring::digest::SHA256, bytes);
-    let hex: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let hash = Sha256::digest(bytes);
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     format!("sha256:{hex}")
 }
 

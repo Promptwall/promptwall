@@ -1,0 +1,27 @@
+{
+  "name": "@promptwall/sdk",
+  "version": "0.0.1",
+  "description": "Promptwall AI firewall in your app: the same policy and checks as the proxy, as WebAssembly",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Promptwall/promptwall.git",
+    "directory": "packages/sdk"
+  },
+  "keywords": ["llm", "ai", "firewall", "prompt-injection", "pii", "dlp", "guardrails", "openai", "ai-sdk"],
+  "type": "module",
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.js" },
+    "./openai": { "types": "./openai.d.ts", "default": "./openai.js" },
+    "./ai": { "types": "./ai.d.ts", "default": "./ai.js" },
+    "./wasm/promptwall.wasm": "./wasm/promptwall.wasm"
+  },
+  "files": ["*.js", "*.d.ts", "wasm/promptwall.wasm", "README.md", "LICENSE"],
+  "sideEffects": false,
+  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "build": "node scripts/build-wasm.mjs",
+    "test": "node --test test/*.test.mjs",
+    "prepack": "node scripts/build-wasm.mjs"
+  }
+}

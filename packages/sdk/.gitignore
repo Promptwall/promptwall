@@ -1,0 +1,5 @@
+# Built by `npm run build` from crates/wasm.
+/wasm/
+/node_modules/
+*.tgz
+/LICENSE

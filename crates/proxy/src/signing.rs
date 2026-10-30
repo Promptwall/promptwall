@@ -15,6 +15,8 @@ use base64::Engine;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 
+use crate::Policy;
+
 /// A key that policies must be signed with.
 #[derive(Clone, Debug)]
 pub struct PublicKey(Vec<u8>);
@@ -72,6 +74,12 @@ pub fn read_policy(path: &Path, key: Option<&PublicKey>) -> anyhow::Result<Strin
     }
     String::from_utf8(content)
         .with_context(|| format!("policy file {} is not UTF-8", path.display()))
+}
+
+/// Loads a policy file; with a key, only if its signature is valid.
+pub fn load_policy(path: &Path, key: Option<&PublicKey>) -> anyhow::Result<Policy> {
+    let text = read_policy(path, key)?;
+    Policy::from_yaml(&text).with_context(|| format!("invalid policy file {}", path.display()))
 }
 
 /// A new key pair: (private key, public key), as base64 text.

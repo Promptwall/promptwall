@@ -1,7 +1,7 @@
 //! Signed policies (`--policy-public-key`), at startup and on reload.
 
 use promptwall::reload::{Reload, Watcher};
-use promptwall::{Action, Policy, Proxy, Sample};
+use promptwall::{Action, Proxy, Sample};
 
 fn policy(pii_action: &str) -> String {
     format!(
@@ -31,11 +31,12 @@ fn with_signing_only_signed_policies_load() {
     };
 
     std::fs::write(&path, policy("redact")).unwrap();
-    let err = Policy::load_signed(&path, Some(&key)).unwrap_err();
+    let err = promptwall::signing::load_policy(&path, Some(&key)).unwrap_err();
     assert!(format!("{err:#}").contains("no signature"), "{err:#}");
 
     write_signed(&policy("redact"));
-    let proxy = Proxy::with_policy(Policy::load_signed(&path, Some(&key)).unwrap()).unwrap();
+    let proxy =
+        Proxy::with_policy(promptwall::signing::load_policy(&path, Some(&key)).unwrap()).unwrap();
     let mut watcher = Watcher::new(&path, Some(key));
 
     // Changed without a new signature: rejected, the old policy stays.
