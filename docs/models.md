@@ -91,6 +91,6 @@ Small public sets; treat these as a sanity check. The [benchmark](benchmark.md) 
 
 - [Horizon-Labs/prompt-injection-guard-small](https://huggingface.co/Horizon-Labs/prompt-injection-guard-small) (Apache 2.0) is multilingual, which matters for the German half of the deepset set, and ships an int8 ONNX file. It is the current recommendation.
 - [protectai/deberta-v3-base-prompt-injection-v2](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) (Apache 2.0) is English-only, and dynamic int8 quantisation breaks it (its detection drops to almost zero), so it only runs in fp32.
-- Llama Prompt Guard 2 is not recommended as a default: its licence restricts very large companies, which matters for an acquirer.
+- Llama Prompt Guard 2 is not recommended as a default: its licence restricts very large companies, which rules it out for some adopters.
 
 A smaller in-house model, distilled from these and trained on our own multilingual data, is planned; it is the way to get Tier 2 under 10 ms.

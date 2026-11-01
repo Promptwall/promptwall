@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "promptwall"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "promptwall-classify"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "ort",
@@ -1161,14 +1161,14 @@ dependencies = [
 
 [[package]]
 name = "promptwall-detect"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "promptwall-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "promptwall-wasm"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "promptwall-engine",
  "serde",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "pw-bench"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "pw-mock-upstream"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",

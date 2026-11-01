@@ -2,7 +2,14 @@
 
 **An open source AI firewall.** Promptwall sits between your application and any LLM and blocks prompt injection, jailbreaks and data leaks in both directions, while adding only single-digit milliseconds of latency.
 
-> **Status: early Phase 1.** Promptwall routes requests by a YAML policy and can block secrets and redact personal data in prompts (pattern-based, Tier 1, plus an optional ONNX model for names and addresses). It blocks prompt injection, including encoded and disguised attacks, many-shot jailbreaks and instructions planted in documents (patterns plus an optional ONNX classifier), checks the provider's answers, streamed or not, for leaked secrets, personal data, exfiltration links and system-prompt leaks, limits which tools the model may call and with which arguments, enforces rate and token limits per route, key or user, and can keep requests and answers free of harmful content and on allowed topics (optional ONNX models).
+> **Status: v0.1, the first public release.** The policy format (version 1) is stable; the command line and the check API may still change before 1.0. See the [changelog](CHANGELOG.md) and the [benchmark](docs/benchmark.md) for what it catches today.
+
+**What it does**
+
+- **Data leaks:** blocks secrets (API keys of 13 providers, private keys, passwords) and redacts personal data (emails, IBANs, card numbers, national IDs; names and addresses with an optional model) in prompts, before they reach the provider.
+- **Prompt injection and jailbreaks:** blocks known phrasings, also encoded or disguised, many-shot attacks and instructions planted in documents, plus an optional classifier for freely worded attacks.
+- **Answers:** checks what the model sends back, streamed or not, for leaked secrets and personal data, links that smuggle data out and system-prompt leaks.
+- **Tools, content and limits:** which tools the model may call and how, harmful content and off-limits topics (optional models), and rate and token limits per route, key or user.
 
 ## Goals
 
