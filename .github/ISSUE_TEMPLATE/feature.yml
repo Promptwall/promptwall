@@ -1,0 +1,14 @@
+name: Feature request
+description: Something Promptwall should do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to protect or achieve, and why the current policy options do not cover it.
+    validations: { required: true }
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea

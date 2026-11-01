@@ -1,12 +1,21 @@
 # Contributing to Promptwall
 
-Thanks for your interest in Promptwall. The project is in its design phase, so the most useful contributions right now are reviews of the specs in [`docs/specs`](docs/specs).
+Thanks for your interest in Promptwall. Bug reports, detector bypasses, false alarms and pull requests are all welcome; open an issue first for larger changes, so we can agree on the approach.
+
+## Building and testing
+
+```sh
+cargo test --workspace                          # needs ONNX Runtime; see docs/install.md
+cargo test --workspace --no-default-features    # without the model checks
+cargo fmt --all && cargo clippy --workspace --all-targets
+cd packages/sdk && npm run build && npm test    # the npm package
+```
+
+A prompt that should be blocked but is not belongs in [`tests/attack-corpus.yaml`](tests/attack-corpus.yaml), together with the fix.
 
 ## Contributor Licence Agreement
 
-All contributions require a signed Contributor Licence Agreement (CLA) before they can be merged. The CLA lets the project be relicensed or offered commercially alongside the open source edition while you keep the copyright to your work. A bot will ask you to sign on your first pull request.
-
-> **TODO:** choose the CLA text (for example the Apache Individual and Corporate CLAs) and set up CLA Assistant before the repository becomes public.
+All contributions need a signed [Contributor Licence Agreement](CLA.md) before they can be merged. You keep the copyright to your work; the agreement lets the project offer your contribution under other licences too, for example in a commercial edition, and protects you and users with a patent licence. On your first pull request, a bot asks you to sign by posting a comment; it takes a minute and covers all your later contributions.
 
 ## How changes flow
 
@@ -17,4 +26,4 @@ All contributions require a signed Contributor Licence Agreement (CLA) before th
 
 - Keep each pull request focused on one change.
 - Specs and docs use plain, short sentences.
-- Once code exists, every change must pass the benchmark gate described in [`docs/specs/benchmark.md`](docs/specs/benchmark.md).
+- Every change must pass CI, including the latency gate. Changes to detectors should not lower the [benchmark](docs/benchmark.md) results; rerun it with `benchmark/run.py` and say what changed.

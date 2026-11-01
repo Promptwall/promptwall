@@ -1,7 +1,9 @@
 name: Release
 
 # Pushing a tag such as v0.1.0 builds the downloads, publishes them as a
-# GitHub release and pushes the Docker image to ghcr.io. Running it by hand
+# GitHub release, pushes the Docker image to ghcr.io and publishes the npm
+# package (needs the NPM_TOKEN secret: an npm automation token with publish
+# rights on the @promptwall scope). Running it by hand
 # (Actions, Release, Run workflow) only builds, to check that every platform
 # still compiles; nothing is published.
 on:
@@ -31,7 +33,7 @@ jobs:
         run: |
           linux_x64='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22.04","docker":"amd64"}'
           linux_arm='{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-22.04-arm","docker":"arm64"}'
-          mac='{"target":"aarch64-apple-darwin","os":"macos-14"}'
+          mac='{"target":"aarch64-apple-darwin","os":"macos-15"}'
           windows='{"target":"x86_64-pc-windows-msvc","os":"windows-2022"}'
           if [ "$PRIVATE" = "true" ]; then
             echo "matrix={\"include\":[$linux_x64,$mac,$windows]}" >> "$GITHUB_OUTPUT"
@@ -51,12 +53,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check the tag matches the crate version
+      - name: Check the tag matches every version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
-        run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+        run: scripts/check-version.sh "${GITHUB_REF_NAME#v}"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p promptwall -p pw-mock-upstream
       - name: Smoke test
@@ -146,3 +146,32 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.licenses=Apache-2.0
+
+  npm:
+    name: Publish the npm package
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm provenance: links the package to this build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Build and test
+        working-directory: packages/sdk
+        run: |
+          npm run build
+          cargo build -p promptwall --no-default-features
+          PROMPTWALL_BIN="$GITHUB_WORKSPACE/target/debug/promptwall" npm test
+      - name: Publish
+        working-directory: packages/sdk
+        run: npm publish --provenance --access public --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

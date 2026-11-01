@@ -1,0 +1,27 @@
+name: Detector bypass or false alarm
+description: A prompt or answer that should be caught but is not, or a harmless one that is blocked.
+labels: [detection]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options: [Not caught (bypass), Caught by mistake (false alarm)]
+    validations: { required: true }
+  - type: dropdown
+    id: detector
+    attributes:
+      label: Detector
+      options: [prompt_injection, pii, secrets, exfiltration, system_prompt_leak, tools, content_safety, topics, other]
+    validations: { required: true }
+  - type: textarea
+    id: text
+    attributes:
+      label: The text
+      description: Use made-up values, never real keys or personal data. If the bypass exposes user data in a released version, report it privately instead (see SECURITY.md).
+    validations: { required: true }
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup
+      description: The route's detectors and whether models were loaded (`--injection-model`, `--pii-model`, ...).
