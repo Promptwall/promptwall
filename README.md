@@ -81,7 +81,7 @@ On public datasets, with scripts in [`benchmark`](benchmark) that anyone can rer
 | Prompt injection caught (deepset / jackhhao / Lakera gandalf) | 3% / 21% / 50% | 68% / 90% / 96% |
 | Harmless prompts blocked (deepset / jackhhao) | 0% / 0% | 0% / 1.9% |
 | Personal data and secrets found (690 values, 23 kinds) | 98.1% | |
-| Latency added, p50 (500-token prompts) | < 1 ms | 6 ms at 130 tokens, 180 ms at 500 (beyond a 50 ms provider) |
+| Latency added, p50 | < 1 ms | 6 ms at 130 tokens, 180 ms at 500 (beyond a 50 ms provider) |
 
 ## Repository layout
 
