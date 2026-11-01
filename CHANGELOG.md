@@ -32,7 +32,7 @@ The first public release.
 
 ### npm package
 
-- `@promptwall/sdk`: the same policy and checks in Node, edge functions and the browser, compiled to WebAssembly, with wrappers for the OpenAI client and the Vercel AI SDK. Model checks run on your Promptwall server through the check API.
+- `@promptwall-ai/sdk`: the same policy and checks in Node, edge functions and the browser, compiled to WebAssembly, with wrappers for the OpenAI client and the Vercel AI SDK. Model checks run on your Promptwall server through the check API.
 
 ### Install
 

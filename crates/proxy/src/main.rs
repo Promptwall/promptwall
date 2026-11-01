@@ -86,7 +86,7 @@ struct Args {
 
     /// Serve the check API on POST /promptwall/v1/check, which returns a
     /// route's verdict on one prompt or answer, Tier 2 models included. The
-    /// npm package (@promptwall/sdk) uses it for the model checks it cannot
+    /// npm package (@promptwall-ai/sdk) uses it for the model checks it cannot
     /// run itself.
     #[arg(long, env = "PROMPTWALL_CHECK_API")]
     check_api: bool,
