@@ -31,4 +31,5 @@ jobs:
           path-to-signatures: signatures/cla.json
           path-to-document: https://github.com/Promptwall/promptwall/blob/main/CLA.md
           branch: cla-signatures
-          allowlist: marvinthl,claude,dependabot[bot],github-actions[bot]
+          # Commits made by Claude Code carry the author name "Claude" and no GitHub account.
+          allowlist: marvinthl,Claude,claude,dependabot[bot],github-actions[bot]

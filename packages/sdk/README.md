@@ -1,4 +1,4 @@
-# @promptwall/sdk
+# @promptwall-ai/sdk
 
 [Promptwall](https://github.com/Promptwall/promptwall) in your JavaScript app: the same YAML policy and the same checks as the Promptwall proxy, compiled from the same Rust code to WebAssembly. Prompts are checked before they reach the model and answers before they reach your app: secrets and personal data are redacted or blocked, prompt injection is blocked, and custom patterns and keyword lists apply as in the proxy.
 
@@ -9,7 +9,7 @@
 ## Install
 
 ```sh
-npm install @promptwall/sdk
+npm install @promptwall-ai/sdk
 ```
 
 ## Use
@@ -36,8 +36,8 @@ routes:
 
 ```js
 import OpenAI from "openai";
-import { Promptwall, PromptwallBlockedError } from "@promptwall/sdk";
-import { wrapOpenAI } from "@promptwall/sdk/openai";
+import { Promptwall, PromptwallBlockedError } from "@promptwall-ai/sdk";
+import { wrapOpenAI } from "@promptwall-ai/sdk/openai";
 
 const pw = await Promptwall.load({ policyFile: "promptwall.yaml" });
 const openai = wrapOpenAI(new OpenAI(), pw);
@@ -62,8 +62,8 @@ try {
 ```js
 import { generateText, streamText, wrapLanguageModel } from "ai";
 import { openai } from "@ai-sdk/openai";
-import { Promptwall } from "@promptwall/sdk";
-import { promptwallMiddleware } from "@promptwall/sdk/ai";
+import { Promptwall } from "@promptwall-ai/sdk";
+import { promptwallMiddleware } from "@promptwall-ai/sdk/ai";
 
 const pw = await Promptwall.load({ policy: process.env.PROMPTWALL_POLICY });
 const model = wrapLanguageModel({ model: openai("gpt-4o-mini"), middleware: promptwallMiddleware(pw) });
@@ -93,7 +93,7 @@ if (answer.action === "redact") show(answer.text);
 | `policyFile` | Node only: a path to the policy file |
 | `route` | The route to apply when a call names none. Default: the route named `default`, else the first |
 | `server` | A Promptwall server for the model checks: a URL, or `{ url, token, timeoutMs }` |
-| `wasm` | The WebAssembly module (a `WebAssembly.Module` or bytes), for runtimes that cannot load `@promptwall/sdk/wasm/promptwall.wasm` themselves |
+| `wasm` | The WebAssembly module (a `WebAssembly.Module` or bytes), for runtimes that cannot load `@promptwall-ai/sdk/wasm/promptwall.wasm` themselves |
 
 `wrapOpenAI(client, pw, options)` and `promptwallMiddleware(pw, options)` take `route` and `onVerdict`, a function called with every verdict that found something, for your own logging. Routes with `shadow: true` only report through `onVerdict`; nothing is blocked or changed.
 

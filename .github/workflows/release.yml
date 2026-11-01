@@ -3,7 +3,7 @@ name: Release
 # Pushing a tag such as v0.1.0 builds the downloads, publishes them as a
 # GitHub release, pushes the Docker image to ghcr.io and publishes the npm
 # package (needs the NPM_TOKEN secret: an npm automation token with publish
-# rights on the @promptwall scope). Running it by hand
+# rights on the @promptwall-ai scope). Running it by hand
 # (Actions, Release, Run workflow) only builds, to check that every platform
 # still compiles; nothing is published.
 on:

@@ -1,5 +1,5 @@
 {
-  "name": "@promptwall/sdk",
+  "name": "@promptwall-ai/sdk",
   "version": "0.1.0",
   "description": "Promptwall AI firewall in your app: the same policy and checks as the proxy, as WebAssembly",
   "license": "Apache-2.0",
