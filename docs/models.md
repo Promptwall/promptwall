@@ -87,7 +87,7 @@ Measured with `crates/classify/examples/classify_eval.rs` on the test splits of 
 | ProtectAI DeBERTa-v3 base (fp32) | 37% / 0% | 87% / 2% |
 | Horizon-Labs mmBERT-small (int8) | 68% / 0% | 89% / 4% |
 
-Small public sets; treat these as a sanity check, not a benchmark. Notes:
+Small public sets; treat these as a sanity check. The [benchmark](benchmark.md) measures the whole firewall on more data. Notes:
 
 - [Horizon-Labs/prompt-injection-guard-small](https://huggingface.co/Horizon-Labs/prompt-injection-guard-small) (Apache 2.0) is multilingual, which matters for the German half of the deepset set, and ships an int8 ONNX file. It is the current recommendation.
 - [protectai/deberta-v3-base-prompt-injection-v2](https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2) (Apache 2.0) is English-only, and dynamic int8 quantisation breaks it (its detection drops to almost zero), so it only runs in fp32.
