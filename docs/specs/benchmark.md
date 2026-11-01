@@ -2,7 +2,7 @@
 
 **Status:** draft for review. The benchmark is the gate for every change: no pull request merges if it breaks the latency budget or lowers detection quality.
 
-It has two parts: **latency** (what the firewall costs) and **accuracy** (what it catches).
+Results: [benchmark results](../benchmark.md). It has two parts: **latency** (what the firewall costs) and **accuracy** (what it catches).
 
 ## Latency
 

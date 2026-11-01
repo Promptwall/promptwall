@@ -72,6 +72,17 @@ scripts/bench.sh --stream        # streamed responses
 BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 ```
 
+## Benchmark
+
+On public datasets, with scripts in [`benchmark`](benchmark) that anyone can rerun ([full results](docs/benchmark.md)):
+
+| | Patterns only | Patterns + classifier |
+| --- | --- | --- |
+| Prompt injection caught (deepset / jackhhao / Lakera gandalf) | 3% / 21% / 50% | 68% / 90% / 96% |
+| Harmless prompts blocked (deepset / jackhhao) | 0% / 0% | 0% / 1.9% |
+| Personal data and secrets found (690 values, 23 kinds) | 98.1% | |
+| Latency added, p50 | < 1 ms | 6 ms at 130 tokens, 180 ms at 500 (beyond a 50 ms provider) |
+
 ## Repository layout
 
 | Path | What it is |
@@ -84,6 +95,7 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | `crates/classify` | Tier 2 classifiers on CPU with ONNX Runtime (prompt injection) |
 | `crates/mock-upstream` | Mock OpenAI-compatible upstream used by tests and benchmarks |
 | `crates/bench` | `pw-bench`, the latency benchmark (`scripts/bench.sh`; load test: `scripts/soak.sh`) |
+| `benchmark` | The public accuracy and latency benchmark ([results](docs/benchmark.md)) |
 | `tests/attack-corpus.yaml` | Attacks and evasions the checks must keep catching, run in CI |
 | `fuzz` | libFuzzer targets (nightly Rust and `cargo fuzz`), run weekly in CI |
 
@@ -96,7 +108,8 @@ BENCH_POLICY=scripts/bench-policy.yaml scripts/bench.sh   # with detectors on
 | [Architecture](docs/architecture.md) | Components, request path, latency budget, deployment modes |
 | [Threat model](docs/specs/threat-model.md) | What the MVP protects against and what it does not |
 | [Policy format](docs/specs/policy-format.md) | The YAML policy language (version 1, stable) and its [JSON Schema](docs/specs/policy-v1.schema.json) |
-| [Benchmark](docs/specs/benchmark.md) | How latency and detection accuracy are measured |
+| [Benchmark results](docs/benchmark.md) | What it catches, what it flags by mistake and what it costs, on public datasets |
+| [Benchmark spec](docs/specs/benchmark.md) | How latency and detection accuracy are measured |
 | [Models](docs/models.md) | Tier 2 classifiers: model format, latency and accuracy of open models |
 | [Monitoring](docs/monitoring.md) | Prometheus metrics, the Grafana dashboard and the decision log |
 | [Signed policies](docs/policy-signing.md) | Accepting only policies signed by your management server or CI |

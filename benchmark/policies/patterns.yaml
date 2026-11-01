@@ -1,0 +1,18 @@
+# Benchmark policy, patterns only (Tier 1). The upstream is never called:
+# texts are sent to the check API.
+version: 1
+upstreams:
+  none: { url: "http://127.0.0.1:9" }
+routes:
+  - name: injection
+    upstream: none
+    input:
+      - detector: prompt_injection
+        action: block
+  - name: dlp
+    upstream: none
+    input:
+      - detector: secrets
+        action: redact
+      - detector: pii
+        action: redact
