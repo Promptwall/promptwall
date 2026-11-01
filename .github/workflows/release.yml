@@ -33,7 +33,7 @@ jobs:
         run: |
           linux_x64='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22.04","docker":"amd64"}'
           linux_arm='{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-22.04-arm","docker":"arm64"}'
-          mac='{"target":"aarch64-apple-darwin","os":"macos-14"}'
+          mac='{"target":"aarch64-apple-darwin","os":"macos-15"}'
           windows='{"target":"x86_64-pc-windows-msvc","os":"windows-2022"}'
           if [ "$PRIVATE" = "true" ]; then
             echo "matrix={\"include\":[$linux_x64,$mac,$windows]}" >> "$GITHUB_OUTPUT"
