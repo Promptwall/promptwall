@@ -88,6 +88,18 @@ pub enum Kind {
     UrlWithData,
     /// The answer repeats the app's system prompt; see [`SystemPromptIndex`].
     SystemPromptLeak,
+    /// An image attached to a request. Its content cannot be read, so it is
+    /// not checked. This crate never reports the attachment kinds; the policy
+    /// engine does, when it finds an attachment it cannot read.
+    AttachedImage,
+    /// An audio or video clip attached to a request.
+    AttachedAudio,
+    /// A file attached to a request whose text cannot be read: a scanned PDF,
+    /// an encrypted or damaged file, or a format without a text reader.
+    AttachedFile,
+    /// An attachment sent as a link or file ID, which the provider fetches
+    /// itself, so the firewall never sees its content.
+    AttachedRemote,
     /// A pattern or keyword list defined in a policy.
     Custom(u16),
 }
@@ -102,12 +114,14 @@ pub enum Category {
     Exfiltration,
     /// Model output that repeats the app's own instructions.
     Leak,
+    /// Attachments whose content cannot be checked.
+    Attachment,
     Custom,
 }
 
 impl Kind {
     /// All built-in kinds.
-    pub const ALL: [Kind; 45] = [
+    pub const ALL: [Kind; 49] = [
         Kind::Email,
         Kind::Phone,
         Kind::Iban,
@@ -153,6 +167,10 @@ impl Kind {
         Kind::HtmlImage,
         Kind::UrlWithData,
         Kind::SystemPromptLeak,
+        Kind::AttachedImage,
+        Kind::AttachedAudio,
+        Kind::AttachedFile,
+        Kind::AttachedRemote,
     ];
 
     pub fn category(self) -> Category {
@@ -183,6 +201,10 @@ impl Kind {
             | Kind::InjectionClassifier => Category::Injection,
             Kind::MarkdownImage | Kind::HtmlImage | Kind::UrlWithData => Category::Exfiltration,
             Kind::SystemPromptLeak => Category::Leak,
+            Kind::AttachedImage
+            | Kind::AttachedAudio
+            | Kind::AttachedFile
+            | Kind::AttachedRemote => Category::Attachment,
             Kind::Custom(_) => Category::Custom,
             _ => Category::Secret,
         }
@@ -237,6 +259,10 @@ impl Kind {
             Kind::HtmlImage => "html_image",
             Kind::UrlWithData => "url_with_data",
             Kind::SystemPromptLeak => "system_prompt",
+            Kind::AttachedImage => "image",
+            Kind::AttachedAudio => "audio",
+            Kind::AttachedFile => "file",
+            Kind::AttachedRemote => "remote",
             Kind::Custom(_) => "custom",
         }
     }
@@ -249,6 +275,7 @@ impl Kind {
             Category::Injection => "injection",
             Category::Exfiltration => "exfiltration",
             Category::Leak => "leak",
+            Category::Attachment => "attachment",
             Category::Custom => "custom",
         };
         format!("{prefix}.{}", self.entity())

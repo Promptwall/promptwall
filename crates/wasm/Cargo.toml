@@ -12,6 +12,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-promptwall-engine = { path = "../engine" }
+# No PDF reader, to keep the npm package small. PDFs count as
+# files that cannot be read.
+promptwall-engine = { path = "../engine", default-features = false }
 serde.workspace = true
 serde_json.workspace = true

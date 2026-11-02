@@ -48,6 +48,7 @@ Mapped to the [OWASP Top 10 for LLM Applications (2025)](https://genai.owasp.org
 - Links: the exfiltration check blocks images from outside hosts, which a client loads without a click, and links whose query carries a long encoded value. A link with a short query (`https://evil.io/?q=data`) is not blocked, since answers link to sources all the time; it only leaks those few characters when the user clicks it.
 - Request bodies are read as JSON only when every object has distinct keys. A body with a key twice (which parsers resolve differently, so the provider might act on a copy the check did not see) is checked as plain text instead, so every copy is checked.
 - Content a provider sees before the firewall decides (optimistic forwarding) is never released to the user if a check fails, but it has been sent upstream. Routes handling sensitive data must disable optimistic forwarding.
+- Attachments: text files and PDFs with a text layer are read and checked like prompt text. Images, audio, scanned PDFs, other binary formats such as Word files, and attachments sent as a link or file ID are not read; text in them (a screenshot with an injection, a scanned contract) is not checked. The `attachments` detector can flag, block or remove them. A redacted PDF reaches the provider as text only.
 - The firewall itself handles sensitive data. It stores no prompt content unless logging is explicitly enabled, and redacts before logging.
 
 ## Security of Promptwall itself

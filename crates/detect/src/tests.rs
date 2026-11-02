@@ -385,12 +385,17 @@ fn entity_names_round_trip() {
 
 #[test]
 fn every_kind_has_a_rule() {
-    // The classifier verdict, the leak check and evasions are not patterns.
+    // The classifier verdict, the leak check, evasions and attachments are
+    // not patterns.
     let not_patterns = [
         Kind::InjectionClassifier,
         Kind::SystemPromptLeak,
         Kind::Obfuscated,
         Kind::ManyShot,
+        Kind::AttachedImage,
+        Kind::AttachedAudio,
+        Kind::AttachedFile,
+        Kind::AttachedRemote,
     ];
     for kind in Kind::ALL.into_iter().filter(|k| !not_patterns.contains(k)) {
         assert!(

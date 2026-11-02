@@ -315,7 +315,8 @@
         "system_prompt_leak",
         "custom",
         "content_safety",
-        "topics"
+        "topics",
+        "attachments"
       ]
     },
     "RuleAction": {

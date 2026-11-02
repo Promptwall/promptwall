@@ -147,6 +147,8 @@ impl PiiModel {
         keys: &[&str],
     ) -> anyhow::Result<Tagged> {
         let wanted = |key: Option<&str>| key.is_some_and(|k| keys.contains(&k));
+        // The text of attachments is tagged like any other prompt text.
+        let opened = crate::attachments::open(json);
         let mut texts = Vec::new();
         crate::inspect::visit_strings(json, None, false, &mut |s, key, _| {
             if wanted(key) {
@@ -154,13 +156,20 @@ impl PiiModel {
             }
         });
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let mut spans = self.find(&refs, rule)?.into_iter();
+        let mut spans = match self.find(&refs, rule) {
+            Ok(spans) => spans.into_iter(),
+            Err(err) => {
+                crate::attachments::close(json, opened);
+                return Err(err);
+            }
+        };
         let mut tagged = Tagged::default();
         crate::inspect::visit_strings(json, None, false, &mut |s, key, _| {
             if wanted(key) {
                 apply(s, &spans.next().unwrap_or_default(), &mut tagged);
             }
         });
+        tagged.changed |= crate::attachments::close(json, opened);
         Ok(tagged)
     }
 

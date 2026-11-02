@@ -48,6 +48,8 @@ pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Largest request body that is scanned; larger ones follow the route's fail mode.
 const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
+/// Larger bodies are scanned on a blocking thread.
+const INLINE_SCAN_BYTES: usize = 256 * 1024;
 
 /// Response header telling the client what Promptwall did (not set in shadow mode).
 const ACTION_HEADER: &str = "x-promptwall-action";
@@ -483,20 +485,40 @@ impl Proxy {
         let output_safety = route.output.as_ref().and_then(|o| o.safety.clone());
         let leak_words = route.output.as_ref().and_then(|o| o.leak_words);
         let checking = Instant::now();
+        let collect = inspect::Collect {
+            untrusted: !jobs.is_empty() || output_safety.is_some(),
+            trusted: leak_words.is_some(),
+        };
         let outcome = if compressed || body.len() > MAX_SCAN_BYTES {
             Err(inspect::Unscannable)
+        } else if body.len() > INLINE_SCAN_BYTES || has_pdf(&body) {
+            // Large bodies and PDFs, which take a while to read, are scanned
+            // off the threads that serve connections.
+            let detector = route.detector.clone();
+            let input = route.input.clone();
+            let except = route.except.clone();
+            let body = body.clone();
+            tokio::task::spawn_blocking(move || {
+                inspect::inspect(&detector, &input, &body, collect, &except)
+            })
+            .await
+            .unwrap_or(Err(inspect::Unscannable))
         } else {
-            inspect::inspect(
-                &route.detector,
-                &route.input,
-                &body,
-                inspect::Collect {
-                    untrusted: !jobs.is_empty() || output_safety.is_some(),
-                    trusted: leak_words.is_some(),
-                },
-                &route.except,
-            )
+            inspect::inspect(&route.detector, &route.input, &body, collect, &route.except)
         };
+        if let Ok(outcome) = &outcome {
+            for (format, checked) in &outcome.attachments {
+                metrics::count(
+                    "promptwall_attachments_total",
+                    &[
+                        ("route", &route.name),
+                        ("format", format.as_str()),
+                        ("checked", if *checked { "true" } else { "false" }),
+                    ],
+                    1,
+                );
+            }
+        }
         metrics::observe(
             "promptwall_check_duration_seconds",
             &[("route", &route.name), ("stage", "rules")],
@@ -967,6 +989,11 @@ pub use promptwall_engine::{Sample, Verdict};
 /// Compares two secrets in time that does not depend on where they differ.
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Whether a body may carry a PDF: `%PDF-` in base64 at the start of a value.
+fn has_pdf(body: &[u8]) -> bool {
+    body.windows(7).any(|w| w == b"JVBERi0")
 }
 
 /// Adds what the PII model found to the outcome of Tier 1.

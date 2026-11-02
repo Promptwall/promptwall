@@ -2,6 +2,12 @@
 
 All notable changes to Promptwall. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/): until 1.0, a minor version may change the command line or the check API, but never policy format version 1.
 
+## [Unreleased]
+
+### Checks
+
+- **Attachments:** text files and PDFs attached to a request (OpenAI, Anthropic, Gemini) are read and checked like any prompt text, so personal data, secrets and injections in them are redacted or blocked. A redacted text file stays a file; a redacted PDF is sent as its text. The new `attachments` detector flags, blocks or removes what cannot be read: images, audio, scanned or binary files, and links or file IDs. New metric `promptwall_attachments_total`.
+
 ## [0.1.0] - unreleased
 
 The first public release.

@@ -40,7 +40,7 @@ struct Histogram {
 }
 
 /// Help text of each metric.
-const HELP: [(&str, &str); 8] = [
+const HELP: [(&str, &str); 9] = [
     (
         "promptwall_requests_total",
         "Requests by route and what Promptwall did: allow, flag, redact, block, rate_limited or no_route.",
@@ -68,6 +68,10 @@ const HELP: [(&str, &str); 8] = [
     (
         "promptwall_uninspected_total",
         "Requests or responses that could not be inspected, by route and direction.",
+    ),
+    (
+        "promptwall_attachments_total",
+        "Attachments in requests by route, format (text, pdf, image, audio, file or remote) and whether their text was checked.",
     ),
     (
         "promptwall_policy_reloads_total",
