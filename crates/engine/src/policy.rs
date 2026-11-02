@@ -147,6 +147,8 @@ pub struct Route {
     pub pii: Option<Arc<PiiRule>>,
     /// Rate and token limits, with their counters.
     pub limits: Option<Arc<Limiter>>,
+    /// The message of the error a blocked request gets, if the policy sets one.
+    pub block_message: Option<Arc<str>>,
 }
 
 /// The `pii` entities that a Tier 2 token-classification model finds.
@@ -201,6 +203,8 @@ pub struct OutputRules {
     pub safety: Option<SafetyRule>,
     /// Names, addresses and other entities in the answer (Tier 2 PII model).
     pub pii: Option<Arc<PiiRule>>,
+    /// The message of the error a blocked answer gets, if the policy sets one.
+    pub block_message: Option<Arc<str>>,
 }
 
 /// Default for `min_words` on `system_prompt_leak`.
@@ -299,6 +303,7 @@ impl Policy {
                 topics: None,
                 pii: None,
                 limits: None,
+                block_message: None,
             }],
             tests: Vec::new(),
             digest: String::new(),
@@ -370,6 +375,12 @@ impl Policy {
                 .transpose()
                 .with_context(|| format!("route {name:?} tools"))?
                 .map(Arc::new);
+            let block_message: Option<Arc<str>> = spec
+                .block_message
+                .or_else(|| file.defaults.block_message.clone())
+                .map(|m| m.trim().to_owned())
+                .filter(|m| !m.is_empty())
+                .map(Into::into);
             let output = if spec.output.is_empty() {
                 ensure!(
                     spec.stream_holdback.is_none(),
@@ -387,6 +398,7 @@ impl Policy {
                         holdback: DEFAULT_HOLDBACK,
                         safety: None,
                         pii: None,
+                        block_message: block_message.clone(),
                     })
                 })
             } else {
@@ -401,6 +413,7 @@ impl Policy {
                     holdback: spec.stream_holdback.unwrap_or(DEFAULT_HOLDBACK),
                     safety: out.safety,
                     pii: out.pii,
+                    block_message: block_message.clone(),
                 }))
             };
             routes.push(Route {
@@ -423,6 +436,7 @@ impl Policy {
                 topics,
                 pii,
                 limits,
+                block_message,
                 name,
             });
         }
@@ -822,6 +836,8 @@ struct DefaultsFile {
     fail_mode: Option<FailMode>,
     /// Only log what would be blocked or redacted; change nothing.
     shadow: Option<bool>,
+    /// The message clients get when a request or answer is blocked.
+    block_message: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -843,6 +859,9 @@ struct RouteFile {
     upstream: String,
     fail_mode: Option<FailMode>,
     shadow: Option<bool>,
+    /// The message clients get when a request or answer is blocked, instead
+    /// of one naming the findings. The findings are still listed in the error.
+    block_message: Option<String>,
     /// Checks on the request. For an entity, the first entry that names it wins.
     #[serde(default)]
     input: Vec<DetectorFile>,

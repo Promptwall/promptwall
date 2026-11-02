@@ -35,7 +35,8 @@ pub enum LimitKey {
     /// All requests on the route together.
     #[default]
     Route,
-    /// Each API key (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`).
+    /// Each API key (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`,
+    /// Azure OpenAI's `api-key`).
     ApiKey,
     /// Each value of a header, such as a user ID the app sets.
     Header(HeaderName),
@@ -175,7 +176,8 @@ impl Limiter {
             LimitKey::ApiKey => headers
                 .get(AUTHORIZATION)
                 .or_else(|| headers.get("x-api-key"))
-                .or_else(|| headers.get("x-goog-api-key")),
+                .or_else(|| headers.get("x-goog-api-key"))
+                .or_else(|| headers.get("api-key")),
             LimitKey::Header(name) => headers.get(name),
         };
         let mut hasher = DefaultHasher::new();

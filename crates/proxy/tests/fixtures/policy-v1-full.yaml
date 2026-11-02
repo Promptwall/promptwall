@@ -4,6 +4,7 @@ version: 1
 defaults:
   fail_mode: closed
   shadow: false
+  block_message: Blocked by the AI security policy.
 upstreams:
   openai: { url: "https://api.openai.com" }
   anthropic: { url: "https://api.anthropic.com" }
@@ -15,6 +16,7 @@ routes:
     upstream: anthropic
     fail_mode: open
     shadow: true
+    block_message: Blocked for the support team.
     input:
       - detector: prompt_injection
         entities: [classifier, ignore_previous]

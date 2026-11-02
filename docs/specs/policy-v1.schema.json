@@ -64,6 +64,13 @@
             "boolean",
             "null"
           ]
+        },
+        "block_message": {
+          "description": "The message clients get when a request or answer is blocked.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -124,6 +131,13 @@
         "shadow": {
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "block_message": {
+          "description": "The message clients get when a request or answer is blocked, instead\nof one naming the findings. The findings are still listed in the error.",
+          "type": [
+            "string",
             "null"
           ]
         },
