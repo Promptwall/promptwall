@@ -281,13 +281,15 @@ async fn whole(check: Arc<OutputCheck>, mut parts: Parts, body: Incoming) -> Res
         return Response::from_parts(parts, full(bytes));
     }
     if action == Action::Block {
-        return blocked_response(&findings);
+        return blocked_response(&check, &findings);
     }
     let body = match (action, new_body) {
         (Action::Redact, Some(b)) => b,
         _ => bytes,
     };
-    parts.headers.remove(header::CONTENT_LENGTH);
+    // A provider may send a whole answer chunked; a length next to
+    // `Transfer-Encoding: chunked` makes clients drop the response.
+    parts.headers.remove(header::TRANSFER_ENCODING);
     parts
         .headers
         .insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
@@ -373,17 +375,30 @@ fn unjudged() -> Response<ProxyBody> {
     )
 }
 
-fn blocked_response(findings: &BTreeMap<String, usize>) -> Response<ProxyBody> {
+fn blocked_response(
+    check: &OutputCheck,
+    findings: &BTreeMap<String, usize>,
+) -> Response<ProxyBody> {
     let kinds: Vec<String> = findings.keys().cloned().collect();
     json_error(
         StatusCode::FORBIDDEN,
         "promptwall_policy_violation",
-        &format!(
-            "Response blocked by Promptwall policy: {}",
-            kinds.join(", ")
-        ),
+        &check.block_message(&kinds),
         &kinds,
     )
+}
+
+impl OutputCheck {
+    /// The message of the error a blocked answer gets.
+    fn block_message(&self, kinds: &[String]) -> String {
+        match &self.rules.block_message {
+            Some(message) => message.to_string(),
+            None => format!(
+                "Response blocked by Promptwall policy: {}",
+                kinds.join(", ")
+            ),
+        }
+    }
 }
 
 /// One server-sent event, held until its text may be released.
@@ -562,9 +577,11 @@ impl Sse {
             self.finished = true;
             self.finish_log();
             let kinds: Vec<String> = self.findings.keys().cloned().collect();
-            let error = serde_json::json!({"error": {
+            // `type: error` is what Anthropic's SDKs expect of an error
+            // event; OpenAI's read only the `error` object.
+            let error = serde_json::json!({"type": "error", "error": {
                 "type": "promptwall_policy_violation",
-                "message": format!("Response blocked by Promptwall policy: {}", kinds.join(", ")),
+                "message": self.check.block_message(&kinds),
                 "findings": kinds,
             }});
             out.extend_from_slice(format!("event: error\ndata: {error}\n\n").as_bytes());

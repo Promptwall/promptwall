@@ -74,6 +74,10 @@ async fn handle(
     config: Config,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let echo = req.headers().get("x-echo").cloned();
+    // Lets tests see the path and query the upstream was asked for.
+    let uri = HeaderValue::from_str(&req.uri().to_string()).ok();
+    // And the API key header Azure OpenAI uses.
+    let api_key = req.headers().get("api-key").cloned();
     // Lets tests check that hop-by-hop headers were not forwarded.
     let saw_hop = req.headers().contains_key("x-hop");
     // Lets tests see exactly what the upstream received.
@@ -174,6 +178,12 @@ async fn handle(
     }
     resp.headers_mut()
         .insert("x-request-bytes", HeaderValue::from(body.len()));
+    if let Some(uri) = uri {
+        resp.headers_mut().insert("x-request-uri", uri);
+    }
+    if let Some(key) = api_key {
+        resp.headers_mut().insert("x-saw-api-key", key);
+    }
     Ok(resp)
 }
 

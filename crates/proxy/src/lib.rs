@@ -637,7 +637,7 @@ impl Proxy {
         let model_action = found.iter().map(|(_, a)| *a).max();
         if !route.shadow && model_action == Some(Action::Block) {
             upstream.abort();
-            return Ok(policy_violation(&outcome));
+            return Ok(policy_violation(route, &outcome));
         }
         let mut resp = match upstream.await {
             Ok(resp) => resp,
@@ -668,7 +668,7 @@ impl Proxy {
             return self.forward(with_body(parts, body), None).await;
         }
         match action {
-            Action::Block => policy_violation(&outcome),
+            Action::Block => policy_violation(route, &outcome),
             Action::Redact => {
                 let body = outcome.redacted_body.unwrap_or(body);
                 self.forward(with_body(parts, body), Some(action)).await
@@ -1105,12 +1105,16 @@ fn check_offered_tools(rules: &tools::ToolRules, body: &[u8], outcome: &mut insp
     }
 }
 
-fn policy_violation(outcome: &inspect::Outcome) -> Response<ProxyBody> {
+fn policy_violation(route: &policy::Route, outcome: &inspect::Outcome) -> Response<ProxyBody> {
     let kinds: Vec<String> = outcome.findings.keys().cloned().collect();
+    let message = match &route.block_message {
+        Some(message) => message.to_string(),
+        None => format!("Request blocked by Promptwall policy: {}", kinds.join(", ")),
+    };
     json_error(
         StatusCode::FORBIDDEN,
         "promptwall_policy_violation",
-        &format!("Request blocked by Promptwall policy: {}", kinds.join(", ")),
+        &message,
         &kinds,
     )
 }

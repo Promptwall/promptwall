@@ -4,6 +4,14 @@ All notable changes to Promptwall. The format follows [Keep a Changelog](https:/
 
 ## [Unreleased]
 
+### Proxy
+
+- `block_message` on a route or under `defaults`: your own text in the error a blocked request or answer gets; the findings are still listed.
+- Fixed: redacting or flagging a whole (not streamed) answer that the provider sent chunked made the response unreadable for the client.
+- Fixed: per-key limits (`key: api_key`) did not read Azure OpenAI's `api-key` header, so all Azure keys shared one count.
+- The error event that ends a blocked stream now has `"type": "error"`, as Anthropic's SDKs expect.
+- Tests with recorded Anthropic Messages and Azure OpenAI requests and answers, streamed and whole.
+
 ### Checks
 
 - **Attachments:** text files and PDFs attached to a request (OpenAI, Anthropic, Gemini) are read and checked like any prompt text, so personal data, secrets and injections in them are redacted or blocked. A redacted text file stays a file; a redacted PDF is sent as its text. The new `attachments` detector flags, blocks or removes what cannot be read: images, audio, scanned or binary files, and links or file IDs. New metric `promptwall_attachments_total`.
