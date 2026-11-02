@@ -530,6 +530,9 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
             (DetectorName::Exfiltration | DetectorName::SystemPromptLeak, Side::Input) => {
                 bail!("exfiltration and system_prompt_leak check responses; use them under output")
             }
+            (DetectorName::Attachments, Side::Output) => {
+                bail!("attachments checks requests; use it under input")
+            }
             _ => {}
         }
         if let Some(domains) = &spec.allow_domains {
@@ -637,6 +640,7 @@ fn compile_detectors(specs: &[DetectorFile], side: Side) -> anyhow::Result<Compi
             DetectorName::Secrets => Category::Secret,
             DetectorName::PromptInjection => Category::Injection,
             DetectorName::Exfiltration => Category::Exfiltration,
+            DetectorName::Attachments => Category::Attachment,
             DetectorName::SystemPromptLeak => {
                 ensure!(
                     spec.entities.is_empty(),
@@ -1024,6 +1028,10 @@ enum DetectorName {
     Custom,
     ContentSafety,
     Topics,
+    // Attachments whose content cannot be checked: images, audio, files
+    // without readable text, and links or file IDs the provider fetches.
+    // Readable attachments are checked by the other detectors like any text.
+    Attachments,
 }
 
 /// The JSON Schema of the policy format, for editors and management tools.

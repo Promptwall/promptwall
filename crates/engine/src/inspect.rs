@@ -11,6 +11,7 @@ use bytes::Bytes;
 use promptwall_detect::{Category, Detector, Kind};
 use serde_json::Value;
 
+use crate::attachments::{self, Format};
 use crate::policy::{Action, Except};
 
 /// Result of inspecting one body.
@@ -29,6 +30,8 @@ pub struct Outcome {
     /// The app's own instructions (system prompt), for the leak check on the
     /// response; only collected when asked for.
     pub trusted_text: String,
+    /// The format of each attachment and whether its text was read and checked.
+    pub attachments: Vec<(Format, bool)>,
 }
 
 /// Which prompt text [`inspect`] gathers besides scanning.
@@ -90,6 +93,19 @@ pub fn inspect(
     // counts, so the provider might act on the copy the check did not see.
     if let Ok(Strict(mut json)) = serde_json::from_slice::<Strict>(body) {
         let mut changed = false;
+        // Attachments with readable text are checked as text parts; the
+        // others are findings of their own, if the route lists them.
+        let mut opened = attachments::open(&mut json);
+        for a in &mut opened {
+            outcome.attachments.push((a.format, a.unreadable.is_none()));
+            let Some((kind, &action)) = a.unreadable.and_then(|k| Some((k, actions.get(&k)?)))
+            else {
+                continue;
+            };
+            *outcome.findings.entry(detector.label(kind)).or_default() += 1;
+            outcome.action = outcome.action.max(Some(action));
+            a.remove = action == Action::Redact;
+        }
         visit_strings(&mut json, None, false, &mut |s, key, trusted| {
             if key.is_some_and(|k| TEXT_KEYS.contains(&k) || SYSTEM_FIELDS.contains(&k)) {
                 let into = match trusted {
@@ -106,6 +122,7 @@ pub fn inspect(
             }
             changed |= scan_string(detector, actions, except, s, trusted, &mut outcome);
         });
+        changed |= attachments::close(&mut json, opened);
         if changed && outcome.action == Some(Action::Redact) {
             // Serializing a parsed Value cannot fail.
             outcome.redacted_body = Some(serde_json::to_vec(&json).unwrap_or_default().into());

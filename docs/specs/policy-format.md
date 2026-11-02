@@ -18,6 +18,7 @@
 | `detector: pii` with model entities (`person`, `street_address`, ...) and `threshold`, on input and output | Yes, with `--pii-model` |
 | `except` on `pii`, `secrets`, `custom`, `prompt_injection` and `exfiltration` entries; `action: allow` | Yes |
 | `tests` (`route`, `input` or `output`, `expect`), `promptwall validate`, `test` and `scan` | Yes |
+| `routes[].input` with `detector: attachments`, `entities` (`image`, `audio`, `file`, `remote`), `action` | Yes |
 | `routes[].limits` with `key`, `requests_per_minute`, `requests_per_day`, `tokens_per_minute`, `tokens_per_day` | Yes |
 | `mode: indirect`, `untrusted_content`, `rules`, `action: rewrite` | Planned, as additions to version 1 |
 
@@ -123,6 +124,37 @@ output:
 ```
 
 `content_safety` findings are `safety.<category>` (or `safety.unsafe`). `entities` lists the categories that count; the loaded model decides which exist, and an unknown one is an error at startup. `topics` gives `topic.denied` when the prompt is about a denied topic, and `topic.off_topic` when the route has allowed topics and the prompt is about none of them. Both check only text from the user and tools, not the system prompt. They run alongside the provider call like the injection classifier: `parallel` on `prompt_injection` applies to them too. The models cannot point at a span, so `redact` blocks. If a model fails, the route's `fail_mode` decides.
+
+## Attachments
+
+Files, images and audio that a request carries are found in the formats of the OpenAI Chat Completions and Responses APIs, Anthropic Messages and Gemini.
+
+**Readable attachments are checked like any prompt text.** Plain text files (text, CSV, JSON, Markdown, XML, YAML and similar) and PDFs with a text layer are read, and every input detector applies to their text: patterns, the injection classifier, content safety, topics and the PII model. A finding in an attachment blocks, redacts or flags the request exactly as it would in a message. When something is redacted:
+
+- A text file stays a file: it is sent with the redacted text, under the same name and type.
+- A PDF cannot be rewritten, so it is replaced by a text part with its redacted text, headed `[Attachment report.pdf, text only]`. Layout and images in the PDF are lost; the model reads the text.
+- An attachment with nothing to redact is forwarded byte for byte as the client sent it.
+
+**Attachments that cannot be read** are images, audio and video, scanned PDFs without a text layer, encrypted or damaged files, other binary formats (such as Word files), text over 2 MiB, and links or file IDs that the provider fetches itself. Their content is not checked. The `attachments` detector decides what happens to them:
+
+```yaml
+input:
+  - detector: attachments
+    entities: [image, audio]   # empty: all four
+    action: redact             # remove them, leaving [REDACTED:IMAGE] in their place
+  - detector: attachments
+    entities: [file, remote]
+    action: block
+```
+
+| Entity | Attachment |
+| --- | --- |
+| `image` | An image sent inline |
+| `audio` | Audio or video sent inline |
+| `file` | A file whose text cannot be read |
+| `remote` | A link (`https://...`, `gs://...`) or file ID that the provider fetches |
+
+Findings are `attachment.<entity>`. `block` rejects the request, `redact` removes the attachment and `flag` only logs. Without an `attachments` entry, they are forwarded unchecked, as before. Every attachment is counted in the `promptwall_attachments_total` metric, by format and whether its text was checked, so you can see what passes before deciding. Requests over 4 MiB are not inspected at all and follow the route's `fail_mode`, which matters for large PDFs. The npm package does not read PDFs; there they count as `file`.
 
 ## Names and addresses
 

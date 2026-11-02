@@ -3,6 +3,7 @@
 //! `promptwall`) serves it over HTTP; `promptwall-wasm` compiles it to
 //! WebAssembly for the npm package, so both apply the same rules.
 
+pub mod attachments;
 pub mod inspect;
 pub mod limits;
 pub mod moderation;
