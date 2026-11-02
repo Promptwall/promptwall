@@ -2,12 +2,17 @@
 every text of benchmark/data through it, and writes the results to
 benchmark/results/accuracy.json (and a summary to stdout).
 
-    python benchmark/fetch.py && python benchmark/dlp_set.py
+    python benchmark/fetch.py && python benchmark/german_set.py && python benchmark/dlp_set.py
     cargo build --release -p promptwall
+    cargo build --release -p promptwall-classify --example classify_scores
     python benchmark/run.py [--injection-model DIR]
 
 Without --injection-model only the patterns (Tier 1) are measured; with it,
-also patterns plus the classifier (Tier 2). Only the standard library is used.
+also patterns plus the classifier (Tier 2) at threshold 0.5 through the
+firewall, a threshold sweep at fixed false-alarm rates (thresholds chosen on
+the dev split, results on the test split), and long documents scored on
+their last 8 windows (today's limit) and on all windows. Only the standard
+library is used.
 """
 
 import argparse
@@ -18,6 +23,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from collections import defaultdict
@@ -90,31 +96,117 @@ def latency(results):
     return {"p50_ms": round(statistics.median(ms), 2), "p95_ms": round(ms[int(0.95 * (len(ms) - 1))], 2)}
 
 
-def injection(server, rows):
-    """Detection rate and false-positive rate for each dataset."""
-    results = run_all(server, rows, "injection", workers=1)
-    by_set = defaultdict(lambda: {"attacks": 0, "caught": 0, "benign": 0, "false_alarms": 0})
-    examples = defaultdict(list)
-    for row, r in zip(rows, results):
-        s = by_set[row["set"]]
-        hit = r["action"] == "block"
+def rates(rows, hits):
+    """Detection and false-alarm rate of `hits` (one bool per row)."""
+    s = {"attacks": 0, "caught": 0, "benign": 0, "false_alarms": 0}
+    for row, hit in zip(rows, hits):
         if row["label"] == 1:
             s["attacks"] += 1
             s["caught"] += hit
         else:
             s["benign"] += 1
             s["false_alarms"] += hit
-            if hit and len(examples[row["set"]]) < 5:
-                examples[row["set"]].append(row["text"][:160])
+    return {**s, "detection_rate": pct(s["caught"], s["attacks"]),
+            "false_positive_rate": pct(s["false_alarms"], s["benign"])}
+
+
+def by(rows, values, key):
+    groups = defaultdict(lambda: ([], []))
+    for row, v in zip(rows, values):
+        groups[key(row)][0].append(row)
+        groups[key(row)][1].append(v)
+    return dict(sorted(groups.items()))
+
+
+def injection(server, rows):
+    """Detection rate and false-positive rate for each dataset, and for each
+    language where a set has more than one. Returns the hits as well."""
+    results = run_all(server, rows, "injection", workers=1)
+    hits = [r["action"] == "block" for r in results]
     out = {}
-    for name, s in sorted(by_set.items()):
-        out[name] = {
-            **s,
-            "detection_rate": pct(s["caught"], s["attacks"]),
-            "false_positive_rate": pct(s["false_alarms"], s["benign"]),
-            "false_alarm_examples": examples[name],
-        }
-    return out, latency(results)
+    for name, (rs, hs) in by(rows, hits, lambda r: r["set"]).items():
+        out[name] = rates(rs, hs)
+        langs = by(rs, hs, lambda r: r.get("lang", "en"))
+        if len(langs) > 1:
+            out[name]["by_language"] = {lang: rates(*v) for lang, v in langs.items() if len(v[0]) >= 10}
+        out[name]["false_alarm_examples"] = [r["text"][:160] for r, h in zip(rs, hs) if h and r["label"] == 0][:5]
+    return out, latency(results), hits
+
+
+# Sets whose harmless prompts decide the thresholds at a fixed false-alarm rate:
+# ordinary prompts, not the app-specific SPML ones or documents (BIPIA, long
+# documents), which are reported at the same thresholds.
+CALIBRATION_SETS = {"deepset", "jackhhao", "notinject", "german"}
+TARGET_FPR = [0.5, 1.0, 2.0]
+
+
+def average_precision(labels, scores):
+    pairs = sorted(zip(scores, labels), key=lambda p: -p[0])
+    positives = sum(labels)
+    if not positives:
+        return None
+    tp, total = 0, 0.0
+    for k, (_, label) in enumerate(pairs, 1):
+        if label:
+            tp += 1
+            total += tp / k
+    return round(100 * total / positives, 1)
+
+
+def sweep(rows, tier1, scores):
+    """Patterns or classifier at the threshold that keeps false alarms at 0.5%,
+    1% and 2% on the dev split's harmless prompts; results on the test split."""
+    combined = [max(float(t), s) for t, s in zip(tier1, scores)]
+    benign_dev = sorted((c for r, c in zip(rows, combined)
+                         if r["split"] == "dev" and r["label"] == 0 and r["set"] in CALIBRATION_SETS), reverse=True)
+    thresholds = {}
+    for target in TARGET_FPR:
+        allowed = int(len(benign_dev) * target / 100)
+        # The lowest threshold that flags no more than `allowed` harmless dev prompts.
+        t = benign_dev[allowed] + 1e-6 if allowed < len(benign_dev) else 0.0
+        thresholds[f"{target}%"] = round(min(t, 1.0), 6)
+    test = [(r, c) for r, c in zip(rows, combined) if r["split"] == "test"]
+    out = {"thresholds": thresholds, "calibration": {"sets": sorted(CALIBRATION_SETS), "harmless_dev_prompts": len(benign_dev)},
+           "test": {}}
+    groups = by([r for r, _ in test], [c for _, c in test], lambda r: r["set"])
+    for name, (rs, cs) in groups.items():
+        entry = {"pr_auc": average_precision([r["label"] for r in rs], cs)}
+        for label, t in thresholds.items():
+            entry[f"at {label} false alarms"] = rates(rs, [c >= t for c in cs])
+        langs = by(rs, cs, lambda r: r.get("lang", "en"))
+        if len(langs) > 1:
+            t = thresholds["1.0%"]
+            entry["by_language at 1.0%"] = {lang: rates(lr, [c >= t for c in lc])
+                                            for lang, (lr, lc) in langs.items() if len(lr) >= 10}
+        out["test"][name] = entry
+    return out
+
+
+def long_documents(rows, tier1, scores_tail, scores_all, thresholds=(0.5, 0.9, 0.99)):
+    """Long documents by planted position, scoring only the last 8 windows
+    (what the firewall does today) and scoring every window, at several
+    thresholds: with many windows per document, false alarms add up."""
+    out = {}
+    for name, scores in (("last 8 windows", scores_tail), ("all windows", scores_all)):
+        for t in thresholds:
+            hits = [t1 or s >= t for t1, s in zip(tier1, scores)]
+            entry = {"all": rates(rows, hits)}
+            for pos, (rs, hs) in by(rows, hits, lambda r: r["position"] or "none").items():
+                entry[pos] = rates(rs, hs)
+            for tokens, (rs, hs) in by(rows, hits, lambda r: r["tokens"]).items():
+                entry[f"{tokens} tokens"] = rates(rs, hs)
+            out[f"{name}, threshold {t}"] = entry
+    return out
+
+
+def classifier_scores(binary, model, rows, all_windows=False):
+    """Raw classifier scores for `rows`, from the classify_scores example."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp) / "in.jsonl", Path(tmp) / "out.jsonl"
+        src.write_text("".join(json.dumps({"text": r["text"]}, ensure_ascii=False) + "\n" for r in rows), encoding="utf-8")
+        subprocess.run([binary, model, str(src), str(dst), *(["--all"] if all_windows else [])], check=True)
+        out = [json.loads(line) for line in dst.read_text().splitlines()]
+    return [o["score"] for o in out], [o["ms"] for o in out]
 
 
 def dlp(server, rows, benign_prompts):
@@ -173,23 +265,38 @@ def dlp(server, rows, benign_prompts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default=str(ROOT.parent / "target" / "release" / ("promptwall.exe" if os.name == "nt" else "promptwall")))
+    release = ROOT.parent / "target" / "release"
+    exe = ".exe" if os.name == "nt" else ""
+    ap.add_argument("--binary", default=str(release / f"promptwall{exe}"))
+    ap.add_argument("--scores-binary", default=str(release / "examples" / f"classify_scores{exe}"),
+                    help="build with: cargo build --release -p promptwall-classify --example classify_scores")
     ap.add_argument("--injection-model", help="directory of the prompt-injection classifier (Tier 2)")
     ap.add_argument("--model-name", default="Horizon-Labs/prompt-injection-guard-small (int8)")
     args = ap.parse_args()
 
     inj, dlp_rows = load("injection.jsonl"), load("dlp.jsonl")
-    benign = [r for r in inj if r["label"] == 0]
+    if (DATA / "german.jsonl").exists():
+        inj += load("german.jsonl")
+    docs = load("longdocs.jsonl") if (DATA / "longdocs.jsonl").exists() else []
+    benign = [r for r in inj if r["label"] == 0 and r["set"] not in ("bipia",)]
     setups = {}
     with Server(args.binary, POLICIES / "patterns.yaml") as s:
-        inj_res, inj_lat = injection(s, inj)
+        inj_res, inj_lat, tier1 = injection(s, inj)
+        doc_res, _, doc_tier1 = injection(s, docs) if docs else ({}, None, [])
         dlp_res, dlp_lat = dlp(s, dlp_rows, benign)
-        setups["patterns"] = {"injection": inj_res, "dlp": dlp_res, "latency": {"injection": inj_lat, "dlp": dlp_lat}}
+        setups["patterns"] = {"injection": {**inj_res, **doc_res}, "dlp": dlp_res,
+                              "latency": {"injection": inj_lat, "dlp": dlp_lat}}
     if args.injection_model:
         extra = ["--injection-model", args.injection_model]
         with Server(args.binary, POLICIES / "classifier.yaml", extra) as s:
-            inj_res, inj_lat = injection(s, inj)
+            inj_res, inj_lat, _ = injection(s, inj)
             setups["patterns+classifier"] = {"injection": inj_res, "model": args.model_name, "latency": {"injection": inj_lat}}
+        scores, _ = classifier_scores(args.scores_binary, args.injection_model, inj)
+        setups["patterns+classifier"]["sweep"] = sweep(inj, tier1, scores)
+        if docs:
+            tail, _ = classifier_scores(args.scores_binary, args.injection_model, docs)
+            full, _ = classifier_scores(args.scores_binary, args.injection_model, docs, all_windows=True)
+            setups["patterns+classifier"]["long_documents"] = long_documents(docs, doc_tier1, tail, full)
 
     RESULTS.mkdir(exist_ok=True)
     version = subprocess.run([args.binary, "--version"], capture_output=True, text=True).stdout.strip()
@@ -205,8 +312,19 @@ def main():
     for name, setup in setups.items():
         print(f"\n{name}")
         for ds, r in setup["injection"].items():
-            print(f"  {ds:<40} caught {r['detection_rate']}% of {r['attacks']}, false alarms {r['false_positive_rate']}% of {r['benign']}")
+            print(f"  {ds:<12} caught {r['detection_rate']}% of {r['attacks']}, false alarms {r['false_positive_rate']}% of {r['benign']}")
+            for lang, l in r.get("by_language", {}).items():
+                print(f"    {lang}: caught {l['detection_rate']}% of {l['attacks']}, false alarms {l['false_positive_rate']}% of {l['benign']}")
         print(f"  check latency p50 {setup['latency']['injection']['p50_ms']} ms, p95 {setup['latency']['injection']['p95_ms']} ms")
+        if "sweep" in setup:
+            sw = setup["sweep"]
+            print(f"  thresholds for 0.5/1/2% false alarms on dev: {list(sw['thresholds'].values())}")
+            for ds, e in sw["test"].items():
+                cells = "  ".join(f"{k.split()[1]}: {v['detection_rate']}%/{v['false_positive_rate']}%"
+                                  for k, v in e.items() if k.startswith("at "))
+                print(f"    test {ds:<10} PR-AUC {e['pr_auc']}  {cells}")
+        for kind, e in setup.get("long_documents", {}).items():
+            print(f"  long documents, {kind}: caught {e['all']['detection_rate']}%, false alarms {e['all']['false_positive_rate']}%")
         if "dlp" in setup:
             d = setup["dlp"]
             print(f"  dlp: found {d['recall']}% of {d['values']} values, fully redacted {d['redacted']}%, "
